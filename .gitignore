@@ -4,3 +4,11 @@
 .httr-oauth
 .DS_Store
 .quarto
+
+*.csv
+*.rds
+*.xlsx
+*.Rda
+
+*.pdf
+*.html
