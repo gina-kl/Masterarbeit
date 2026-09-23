@@ -16,13 +16,16 @@ library(magrittr)    # Pipe operators and utilities
 library(survival)    # Recurrent event analysis
 library(mets)
 
+# functions
+source("functions.R")
+
 # Constants
 n_pts <- 2778        # Total number of patients (both arms)
 nboot <- 1000        # Number of bootstrap samples
 
 # Load simulated data
-current_file <- "./results/Odat_scen08_run001.rds"
-Odat <- readRDS("./results/Odat_scen08_run001.rds")
+current_file <- "./results/Odat_scen01_run001.rds"
+Odat <- readRDS(current_file)
 
 # load log data
 sim_log <- read_csv("./results/00_simulation_log.csv", show_col_types = FALSE)
@@ -96,7 +99,7 @@ ipwtm_cens <- ipwtm(
   exposure = dropout_event,        # Dependent variable: dropout indicator
   family = "binomial",             # Logistic regression
   link = "logit",                  
-  numerator = ~ arm + age + base_risk,                     # Model for numerator (baseline covariates only)
+  numerator = ~ arm + age + base_risk,                                       # Model for numerator (baseline covariates only)
   denominator = ~ arm + age + base_risk + CumTrain,        # Full model including time-varying covariates (CumTrain)
   id = ID,                         # Cluster identifier
   tstart = tstart,                 # Start of time interval
@@ -104,6 +107,20 @@ ipwtm_cens <- ipwtm(
   type = "cens",                   # Type of weights: Censoring weights (IPCW)
   data = Odat_counting             
 )
+
+#plot inverse probability of censoring weights
+
+pdf("IPCW_Weights.pdf", width = 10, height = 6) # open PDF 
+ipwplot(
+  weights = ipwtm_cens$ipw.weights,
+  timevar = Odat_counting$tstop,
+  binwidth = 4,
+  ylim = c(0, 3),
+  main = "Stabilized IPCW over time"
+)
+abline(h = 1, col = "red", lty = 2, lwd = 2)
+dev.off() # close and save
+
 
 # Incorporate weights into the counting process data
 Odat_counting_weights <- Odat_counting %>%
@@ -135,11 +152,13 @@ cox_weighted <- coxph(
 #  LWYY without IPW
 cox_unweighted <- coxph(
   Surv(tstart, tstop, Yobs) ~ arm + age + base_risk + cluster(ID), 
-  data = Odat_counting_weights,  
+  data = Odat_counting,  
   #cluster = ID,                                
   #weights = weights_cens,
   robust = TRUE                                 
 )
+
+
 
 # # Gosh-Lin without IPW
 # # Problem mit Dropout! zu zensierung?
@@ -160,24 +179,46 @@ cox_unweighted <- coxph(
 #   id = Odat_counting_weights$ID
 # )
 
-# Extract summary statistics
-summary_cox <- summary(cox_weighted)
-coef_cox_weighted <- summary_cox$coefficients["arm", "coef"]            # Log Hazard Ratio for treatment
-se_cox_weighted_naive <- summary_cox$coefficients["arm", "robust se"]   # Robust standard error
-p_val_cox_weighted <- summary_cox$coefficients["arm", "Pr(>|z|)"]       # P-Value
-rej_cox_weighted_naive <- ifelse(p_val_cox_weighted < 0.05, 1, 0)       # Reject Null Hypothesis (1 = Yes)
+#############################################################
+# -----Calculate mean number of falls--------------------------#
+############################################################
+# Use G compuation to compute mean number of falls
 
-# bias
-#bias_unweighted <- coef_unweighted - true_beta
-bias_weighted   <- coef_cox_weighted - true_beta
+exposed <- Odat_counting_weights %>% mutate(arm = 1)       # Training group
+unexposed <- Odat_counting_weights %>% mutate(arm = 0)     # Control group
+
+# predict both outcomes for each patient
+pred_exposed <- survfit(cox_weighted, newdata = exposed) 
+pred_unexposed <- survfit(cox_weighted, newdata = unexposed)
+
+# compute marginal effect
+mcf_marginal <- data.frame(
+  time = pred_exposed$time,
+  mean_exposed = rowMeans(pred_exposed$cumhaz),
+  mean_unexposed = rowMeans(pred_unexposed$cumhaz)
+)
+
+mcf_marginal%>%
+  filter(time <= 52) %>%
+  tail(1) %>%
+  mutate(
+    difference = mean_exposed - mean_unexposed,
+    rate_ratio = mean_exposed / mean_unexposed
+  )
+
+#############################################################
+# -----Extract results        --------------------------#
+############################################################
 
 
-cat("\n--- LWYY + IPCW Results ---\n")
-cat("Treatment Effect (Log HR):", round(coef_cox_weighted, 4), "\n")
-cat("Robust SE:              ", round(se_cox_weighted_naive, 4), "\n")
-cat("P-Value:                ", round(p_val_cox_weighted, 4), "\n")
-cat("Significant (alpha=0.05)?", ifelse(rej_cox_weighted_naive == 1, "Yes", "No"), "\n")
+# combine both results in table
+comparison_table <- bind_rows(
+  extract_model_results(cox_unweighted, "1: Naive (Unweighted)", true_beta = true_beta),
+  extract_model_results(cox_weighted,   "2: LWYY + IPCW",        true_beta = true_beta)
+)
 
+# print
+print(comparison_table)
 
 
 
