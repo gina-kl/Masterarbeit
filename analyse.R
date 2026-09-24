@@ -15,6 +15,7 @@ library(tidyverse)   # Data manipulation and visualization
 library(magrittr)    # Pipe operators and utilities
 library(survival)    # Recurrent event analysis
 library(mets)
+library(splines)
 
 # functions
 source("functions.R")
@@ -24,7 +25,7 @@ n_pts <- 2778        # Total number of patients (both arms)
 nboot <- 1000        # Number of bootstrap samples
 
 # Load simulated data
-current_file <- "./results/Odat_scen01_run001.rds"
+current_file <- "./results/Odat_scen21_run001.rds"
 Odat <- readRDS(current_file)
 
 # load log data
@@ -88,108 +89,116 @@ Odat_counting <- Odat_prepared %>%
   mutate(
     tstart = t - 1,                # Start time of each interval 
     tstop = t,                     # Stop time of each interval
-    dropout_event = ifelse(!is.na(dropout_time) & dropout_time == tstop, 1, 0) # Event indicator for Dropout
+    dropout_event = ifelse(!is.na(dropout_time) & dropout_time == tstop, 1, 0), # Event indicator for Dropout
+    cum_events = lag(cumsum(Yobs)),                  
+    cum_events = replace_na(cum_events, 0)           
   ) %>%
   ungroup() %>% 
-  as.data.frame()                  # ipw package strictly need data.frame
+  as.data.frame()   
+    
+# split data for weights calculation
 
-# Estimate inverse probability of censoring weights (IPCW)
-# Here we model the probability of dropping out based on observed covariates
-ipwtm_cens <- ipwtm(
-  exposure = dropout_event,        # Dependent variable: dropout indicator
-  family = "binomial",             # Logistic regression
+Odat_arm0 <- subset(Odat_counting, arm == 0)
+Odat_arm1 <- subset(Odat_counting, arm == 1)
+
+# IPW weights for control group  
+ipw_arm0 <- ipwtm(
+  exposure = dropout_event,        
+  family = "binomial",             
   link = "logit",                  
-  numerator = ~ arm + age + base_risk,                                       # Model for numerator (baseline covariates only)
-  denominator = ~ arm + age + base_risk + CumTrain,        # Full model including time-varying covariates (CumTrain)
-  id = ID,                         # Cluster identifier
-  tstart = tstart,                 # Start of time interval
-  timevar = tstop,                 # End of time interval
-  type = "cens",                   # Type of weights: Censoring weights (IPCW)
-  data = Odat_counting             
+  numerator = ~ age +sex,                                   
+  denominator = ~ age + sex + cum_events,                    
+  id = ID,                         
+  tstart = tstart,                 
+  timevar = tstop,                 
+  type = "cens",  
+  data = Odat_arm0              
 )
 
-#plot inverse probability of censoring weights
-
-pdf("IPCW_Weights.pdf", width = 10, height = 6) # open PDF 
-ipwplot(
-  weights = ipwtm_cens$ipw.weights,
-  timevar = Odat_counting$tstop,
-  binwidth = 4,
-  ylim = c(0, 3),
-  main = "Stabilized IPCW over time"
+# IPW weights for training group
+ipw_arm1 <- ipwtm(
+  exposure = dropout_event,        
+  family = "binomial",             
+  link = "logit",                  
+  numerator = ~ age + sex ,                                   
+  denominator = ~ age + sex  + cum_events + CumTrain,         
+  id = ID,                         
+  tstart = tstart,                 
+  timevar = tstop,                 
+  type = "cens", 
+  data = Odat_arm1              
 )
-abline(h = 1, col = "red", lty = 2, lwd = 2)
-dev.off() # close and save
+
+Odat_arm0$weights_cens <- ipw_arm0$ipw.weights
+Odat_arm1$weights_cens <- ipw_arm1$ipw.weights
 
 
-# Incorporate weights into the counting process data
-Odat_counting_weights <- Odat_counting %>%
-  mutate(weights_cens = ipwtm_cens$ipw.weights) %>%  # Add estimated weights
-  group_by(ID) %>%
-  mutate(
-    cum_events = lag(cumsum(Yobs)),                  # Cumulative events up to previous time point
-    cum_events = replace_na(cum_events, 0)           # Replace NA with 0 for the first row
-  ) %>%
-  ungroup()
+Odat_counting_weights <- bind_rows(Odat_arm0, Odat_arm1) %>%
+  arrange(ID, tstop) %>%
+  as.data.frame()
 
-Odat_counting_weights <- as.data.frame(Odat_counting_weights) # as data.frame for coxph
+
 
 
 ###########################################################
 #----------- Section 4: Fit LWYY Model -------------------#
 ###########################################################
+# update status for LWYY and Gosh
 
-# update status for cox and gosh lin
 Odat_counting_weights <- Odat_counting_weights %>%
   mutate(
-    status_gl = ifelse(status == 2, 0, status), # 0 = cens/Dropout, 1 = fall, 3 = death
-    status_cox = ifelse(status == 1, 1, 0),     # 1 = fall, 0=cens/dropout/death
-    tstop_jitter = ifelse(status_gl != 1, tstop + 0.01, tstop) # if no fall: make interval longer 0,01 weeks (to imitate continuous times)
+    status_gl = ifelse(status == 2, 0, status),  # 0 = cens/Dropout, 1 = Fall, 3 = Death
+    status_cox = ifelse(status == 1, 1, 0)       # 0 = cens/Dropout/Death, 1 = Fall
       )
 
 
-# LWYY + IPW (Marginal Cox Model for Recurrent Events)
-
+# LWYY + IPW 
 cox_weighted <- coxph(
-  Surv(tstart, tstop, status_cox) ~ arm + age + base_risk + cluster(ID), 
+  Surv(tstart, tstop, status_cox) ~ arm + age + sex  + cluster(ID), 
   data = Odat_counting_weights,  
-  #cluster = ID,                                
   weights = weights_cens,
   robust = TRUE                                 
 )
 
-#  LWYY without IPW
+# LWYY without IPW
 cox_unweighted <- coxph(
-  Surv(tstart, tstop, status_cox) ~ arm + age + base_risk + cluster(ID), 
+  Surv(tstart, tstop, status_cox) ~ arm + age + sex + cluster(ID), 
   data = Odat_counting_weights,  
-  #cluster = ID,                                
-  #weights = weights_cens,
   robust = TRUE                                 
 )
 
+#######################
 
-
-# Gosh-Lin with IPW
+Odat_counting_weights_gl <- Odat_counting_weights %>%
+  mutate(
+    # because of discrete simulation times (error)
+    tstop_jitter = ifelse(status_gl %in% c(0, 3), tstop + 0.001, tstop)
+  )
+# Ghosh-Lin + IPW
 gl_weighted <- recreg(
-  Event(tstart, tstop_jitter, status_gl) ~ arm + age + base_risk + cluster(ID), 
-  data = Odat_counting_weights,
+  Event(tstart, tstop_jitter, status_gl) ~ arm + age + sex + cluster(ID),
+  data = Odat_counting_weights_gl,
   cause = 1,
+  cens.code = 0,
   death.code = 3,
-  weights = Odat_counting_weights$weights_cens
+  weights = Odat_counting_weights_gl$weights_cens  
 )
 
-# Gosh-Lin + IPW
+# Ghosh-Lin without IPW
 gl_unweighted <- recreg(
-  Event(tstart, tstop_jitter, status_gl) ~ arm + age + base_risk + cluster(ID), 
-  data = Odat_counting_weights,
+  Event(tstart, tstop_jitter, status_gl) ~ arm + age + sex + cluster(ID),
+  data = Odat_counting_weights_gl,
   cause = 1,
+  cens.code = 0,
   death.code = 3
 )
+
 
 #############################################################
 # -----Calculate mean number of falls--------------------------#
 ############################################################
-# Use G compuation to compute mean number of falls
+# Use G computation to compute mean number of falls
+# or with recurrent_marginal in mets package?
 
 exposed <- Odat_counting_weights %>% mutate(arm = 1)       # Training group
 unexposed <- Odat_counting_weights %>% mutate(arm = 0)     # Control group
@@ -212,6 +221,25 @@ mcf_marginal%>%
     difference = mean_exposed - mean_unexposed,
     rate_ratio = mean_exposed / mean_unexposed
   )
+
+pred_exposed_unweighted <- survfit(cox_unweighted, newdata = exposed) 
+pred_unexposed_unweighted <- survfit(cox_unweighted, newdata = unexposed)
+
+# compute marginal effect
+mcf_marginal_unweighted <- data.frame(
+  time = pred_exposed_unweighted$time,
+  mean_exposed = rowMeans(pred_exposed_unweighted$cumhaz),
+  mean_unexposed = rowMeans(pred_unexposed_unweighted$cumhaz)
+)
+
+mcf_marginal_unweighted%>%
+  filter(time <= 52) %>%
+  tail(1) %>%
+  mutate(
+    difference = mean_exposed - mean_unexposed,
+    rate_ratio = mean_exposed / mean_unexposed
+  )
+
 
 #############################################################
 # -----Extract results        --------------------------#
@@ -292,4 +320,3 @@ Odat %>%
     color = "Ereignis"
   ) +
   theme_minimal(base_size = 12)
-
