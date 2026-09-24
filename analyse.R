@@ -139,10 +139,19 @@ Odat_counting_weights <- as.data.frame(Odat_counting_weights) # as data.frame fo
 #----------- Section 4: Fit LWYY Model -------------------#
 ###########################################################
 
+# update status for cox and gosh lin
+Odat_counting_weights <- Odat_counting_weights %>%
+  mutate(
+    status_gl = ifelse(status == 2, 0, status), # 0 = cens/Dropout, 1 = fall, 3 = death
+    status_cox = ifelse(status == 1, 1, 0),     # 1 = fall, 0=cens/dropout/death
+    tstop_jitter = ifelse(status_gl != 1, tstop + 0.01, tstop) # if no fall: make interval longer 0,01 weeks (to imitate continuous times)
+      )
+
+
 # LWYY + IPW (Marginal Cox Model for Recurrent Events)
 
 cox_weighted <- coxph(
-  Surv(tstart, tstop, Yobs) ~ arm + age + base_risk + cluster(ID), 
+  Surv(tstart, tstop, status_cox) ~ arm + age + base_risk + cluster(ID), 
   data = Odat_counting_weights,  
   #cluster = ID,                                
   weights = weights_cens,
@@ -151,8 +160,8 @@ cox_weighted <- coxph(
 
 #  LWYY without IPW
 cox_unweighted <- coxph(
-  Surv(tstart, tstop, Yobs) ~ arm + age + base_risk + cluster(ID), 
-  data = Odat_counting,  
+  Surv(tstart, tstop, status_cox) ~ arm + age + base_risk + cluster(ID), 
+  data = Odat_counting_weights,  
   #cluster = ID,                                
   #weights = weights_cens,
   robust = TRUE                                 
@@ -160,24 +169,22 @@ cox_unweighted <- coxph(
 
 
 
-# # Gosh-Lin without IPW
-# # Problem mit Dropout! zu zensierung?
-# gl_unweighted <- recreg(
-#   Event(tstart, tstop, status) ~ arm + age + base_risk + cluster(ID), 
-#   data = Odat_counting_weights,
-#   cause = 1,       # recurrent event 
-#   death.code = 3   # death
-# )
-# 
-# # Gosh-Lin + IPW
-# gl_weighted <- recreg(
-#   Event(tstart, tstop, status) ~ arm + age + base_risk, 
-#   data = Odat_counting_weights,
-#   cause = 1,
-#   death.code = 3,
-#   weights = Odat_counting_weights$weights_cens, 
-#   id = Odat_counting_weights$ID
-# )
+# Gosh-Lin with IPW
+gl_weighted <- recreg(
+  Event(tstart, tstop_jitter, status_gl) ~ arm + age + base_risk + cluster(ID), 
+  data = Odat_counting_weights,
+  cause = 1,
+  death.code = 3,
+  weights = Odat_counting_weights$weights_cens
+)
+
+# Gosh-Lin + IPW
+gl_unweighted <- recreg(
+  Event(tstart, tstop_jitter, status_gl) ~ arm + age + base_risk + cluster(ID), 
+  data = Odat_counting_weights,
+  cause = 1,
+  death.code = 3
+)
 
 #############################################################
 # -----Calculate mean number of falls--------------------------#
@@ -285,3 +292,4 @@ Odat %>%
     color = "Ereignis"
   ) +
   theme_minimal(base_size = 12)
+
