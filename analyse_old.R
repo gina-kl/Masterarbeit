@@ -25,7 +25,7 @@ n_pts <- 2778        # Total number of patients (both arms)
 nboot <- 1000        # Number of bootstrap samples
 
 # Load simulated data
-current_file <- "./results/Odat_scen01_run001.rds"
+current_file <- "./results/Odat_scen21_run001.rds"
 Odat <- readRDS(current_file)
 
 # load log data and true estimands
@@ -49,18 +49,8 @@ if (length(true_beta_marginal) != 1) {
   stop("not found in 00_true_estimands.")
 }
 
-# true value without death (for LWYY)
-true_beta_nodeath <- true_estimands %>%
-  filter(
-    Scenario_Name == current_params$scenario_name[1],
-    Mortality     == current_params$mortality_level[1],
-    True_Beta_Arm == current_params$true_beta_arm[1]
-  ) %>%
-  pull(True_LogRateRatio_NoDeath)
-
 cat("conditional DGP-Parameter (true_beta_arm):", true_beta_dgp, "\n")
 cat("marginal true beta (True_LogRateRatio):    ", true_beta_marginal, "\n")
-cat("marginal true beta without death:          ", true_beta_nodeath, "\n")
 
 
 
@@ -82,7 +72,7 @@ Odat <- Odat %>%
 Odat_prepared <- Odat %>%
   group_by(ID) %>%
   mutate(
-    ttl_events_pts = sum(Yrep, na.rm = TRUE), # Sum of reported events per patient
+    ttl_events_pts = sum(Yobs, na.rm = TRUE), # Sum of events per patient
     ttl_time_pts = max(t)                     # Maximum follow-up time
   ) %>%
   ungroup()
@@ -128,134 +118,60 @@ Odat_counting <- Odat_prepared %>%
     tstart = t - 1,                # Start time of each interval 
     tstop = t,                     # Stop time of each interval
     dropout_event = ifelse(!is.na(dropout_time) & dropout_time == tstop, 1, 0), # Event indicator for Dropout
-    cum_events = lag(cumsum(Yrep)),               # reported falls (lag = time point before)
+    cum_events = lag(cumsum(Yobs)),               # lag = time point before    
     cum_events = replace_na(cum_events, 0),
-    cumTrain_lag = lag(CumTrain),
-    cumTrain_lag = replace_na(cumTrain_lag, 0),
-    cumContact_lag = lag(CumContact),             # answered calls until t-1 (only control)
-    cumContact_lag = replace_na(cumContact_lag, 0),
-    fall_rate_lag    = cum_events     / pmax(tstart, 1),
-    train_rate_lag   = cumTrain_lag   / pmax(tstart, 1),
-    contact_rate_lag = cumContact_lag / pmax(tstart, 1)
+    cumTrain_lag = lag(CumTrain),                
+    cumTrain_lag = replace_na(cumTrain_lag, 0)  
   ) %>%
   ungroup() %>% 
   as.data.frame()   
-
+    
 # split data for weights calculation
 
 Odat_arm0 <- subset(Odat_counting, arm == 0)
 Odat_arm1 <- subset(Odat_counting, arm == 1)
 
-# Three different weights:
-#  - falls:  only (reported) falls
-#  - proxy:  falls + Proxy for Frailty (trainingsgroup: Training, controll: answered calls)
-#  - oracle: true Frailty (not possible, only to see whats possible)
-#
-# ns(tstop, df = 3) : later rates are more important
-
-# Control group: falls
-ipw_arm0_falls <- ipwtm(
-  exposure = dropout_event,
-  family = "binomial",
-  link = "logit",
-  numerator = ~ age + sex + ns(tstop, df = 3),
-  denominator = ~ age + sex + ns(tstop, df = 3) * fall_rate_lag,
-  id = ID,
-  tstart = tstart,
-  timevar = tstop,
-  type = "cens",
-  data = Odat_arm0
+# IPW weights for control group  
+ipw_arm0 <- ipwtm(
+  exposure = dropout_event,        
+  family = "binomial",             
+  link = "logit",                  
+  numerator = ~ age +sex,                                   
+  denominator = ~ age + sex + cum_events,                    
+  id = ID,                         
+  tstart = tstart,                 
+  timevar = tstop,                 
+  type = "cens",  
+  data = Odat_arm0              
 )
 
-# Control group: proxy (reported calls and falls)
-ipw_arm0_proxy <- ipwtm(
-  exposure = dropout_event,
-  family = "binomial",
-  link = "logit",
-  numerator = ~ age + sex + ns(tstop, df = 3),
-  denominator = ~ age + sex + ns(tstop, df = 3) * (fall_rate_lag + contact_rate_lag),
-  id = ID,
-  tstart = tstart,
-  timevar = tstop,
-  type = "cens",
-  data = Odat_arm0
+# IPW weights for training group
+ipw_arm1 <- ipwtm(
+  exposure = dropout_event,        
+  family = "binomial",             
+  link = "logit",                  
+  numerator = ~ age + sex ,                                   
+  denominator = ~ age + sex + cum_events + cumTrain_lag,         
+  id = ID,                         
+  tstart = tstart,                 
+  timevar = tstop,                 
+  type = "cens", 
+  data = Odat_arm1              
 )
 
-# Control group: oracle
-ipw_arm0_oracle <- ipwtm(
-  exposure = dropout_event,
-  family = "binomial",
-  link = "logit",
-  numerator = ~ age + sex + ns(tstop, df = 3),
-  denominator = ~ age + sex + ns(tstop, df = 3) + frailty,
-  id = ID,
-  tstart = tstart,
-  timevar = tstop,
-  type = "cens",
-  data = Odat_arm0
-)
-
-# Training group: falls
-ipw_arm1_falls <- ipwtm(
-  exposure = dropout_event,
-  family = "binomial",
-  link = "logit",
-  numerator = ~ age + sex + ns(tstop, df = 3),
-  denominator = ~ age + sex + ns(tstop, df = 3) * fall_rate_lag,
-  id = ID,
-  tstart = tstart,
-  timevar = tstop,
-  type = "cens",
-  data = Odat_arm1
-)
-
-# Training group: proxy (falls and training)
-ipw_arm1_proxy <- ipwtm(
-  exposure = dropout_event,
-  family = "binomial",
-  link = "logit",
-  numerator = ~ age + sex + ns(tstop, df = 3),
-  denominator = ~ age + sex + ns(tstop, df = 3) * (fall_rate_lag + train_rate_lag),
-  id = ID,
-  tstart = tstart,
-  timevar = tstop,
-  type = "cens",
-  data = Odat_arm1
-)
-
-# Training group: oracle
-ipw_arm1_oracle <- ipwtm(
-  exposure = dropout_event,
-  family = "binomial",
-  link = "logit",
-  numerator = ~ age + sex + ns(tstop, df = 3),
-  denominator = ~ age + sex + ns(tstop, df = 3) + frailty,
-  id = ID,
-  tstart = tstart,
-  timevar = tstop,
-  type = "cens",
-  data = Odat_arm1
-)
-
-Odat_arm0$w_falls       <- ipw_arm0_falls$ipw.weights
-Odat_arm0$w_proxy       <- ipw_arm0_proxy$ipw.weights
-Odat_arm0$w_oracle      <- ipw_arm0_oracle$ipw.weights
-
-Odat_arm1$w_falls       <- ipw_arm1_falls$ipw.weights
-Odat_arm1$w_proxy       <- ipw_arm1_proxy$ipw.weights
-Odat_arm1$w_oracle      <- ipw_arm1_oracle$ipw.weights
+Odat_arm0$weights_cens <- ipw_arm0$ipw.weights
+Odat_arm1$weights_cens <- ipw_arm1$ipw.weights
 
 
 Odat_counting_weights <- bind_rows(Odat_arm0, Odat_arm1) %>%
   arrange(ID, tstop) %>%
-  mutate(weights_cens = w_proxy) %>%    
   as.data.frame()
 
-# check ipw weights for plausibality
+# check ipw wights for plausibality 
 cat("\nDistribtion of IPCW-wights:\n")
-print(summary(Odat_counting_weights[, c("w_falls", "w_proxy", "w_oracle")]))
-cat("Number of weights > 10 (proxy):", sum(Odat_counting_weights$w_proxy > 10), "\n")
-cat("Number of weights > 20 (proxy):", sum(Odat_counting_weights$w_proxy > 20), "\n")
+print(summary(Odat_counting_weights$weights_cens))
+cat("Number of weights > 10:", sum(Odat_counting_weights$weights_cens > 10), "\n")
+cat("Number of weights > 20:", sum(Odat_counting_weights$weights_cens > 20), "\n")
 
 
 
@@ -268,50 +184,22 @@ Odat_counting_weights <- Odat_counting_weights %>%
   mutate(
     status_gl = ifelse(status == 2, 0, status),  # 0 = cens/Dropout, 1 = Fall, 3 = Death
     status_cox = ifelse(status == 1, 1, 0)       # 0 = cens/Dropout/Death, 1 = Fall
-  )
+      )
 
 
-# NEU: Woche des Dropouts/Todes (status 2/3) nicht ins LWYY-Modell aufnehmen.
-# In dieser Woche ist laut Simulation kein Sturz möglich; sonst würde Risikozeit ohne Sturzchance gezählt.
-Odat_lwyy <- Odat_counting_weights %>%
-  filter(status %in% c(0, 1))
-
-# ties = "breslow". per weak several patients are falling (ties)
+# LWYY + IPW 
+cox_weighted <- coxph(
+  Surv(tstart, tstop, status_cox) ~ arm + age + sex  + cluster(ID), 
+  data = Odat_counting_weights,  
+  weights = weights_cens,
+  robust = TRUE                                 
+)
 
 # LWYY without IPW
 cox_unweighted <- coxph(
-  Surv(tstart, tstop, status_cox) ~ arm + age + sex + cluster(ID),
-  data = Odat_lwyy,
-  ties = "breslow",
-  robust = TRUE
-)
-
-# LWYY + IPW (falls)
-cox_falls <- coxph(
-  Surv(tstart, tstop, status_cox) ~ arm + age + sex + cluster(ID),
-  data = Odat_lwyy,
-  weights = w_falls,
-  ties = "breslow",
-  robust = TRUE
-)
-
-# LWYY + IPW (proxy) -- Hauptmodell
-cox_weighted <- coxph(
-  Surv(tstart, tstop, status_cox) ~ arm + age + sex + cluster(ID),
-  data = Odat_lwyy,
-  weights = w_proxy,
-  ties = "breslow",
-  robust = TRUE
-)
-
-
-# LWYY + IPW (oracle)
-cox_oracle <- coxph(
-  Surv(tstart, tstop, status_cox) ~ arm + age + sex + cluster(ID),
-  data = Odat_lwyy,
-  weights = w_oracle,
-  ties = "breslow",
-  robust = TRUE
+  Surv(tstart, tstop, status_cox) ~ arm + age + sex + cluster(ID), 
+  data = Odat_counting_weights,  
+  robust = TRUE                                 
 )
 
 #######################
@@ -345,12 +233,10 @@ gl_unweighted <- recreg(
 # -----Calculate mean number of falls--------------------------#
 ############################################################
 # Use G computation to compute mean number of falls
+# or with recurrent_marginal in mets package?
 
-
-# one row per patient 
-baseline_pts <- Odat_counting_weights %>% distinct(ID, age, sex)
-exposed <- baseline_pts %>% mutate(arm = 1)       # Training group
-unexposed <- baseline_pts %>% mutate(arm = 0)     # Control group
+exposed <- Odat_counting_weights %>% mutate(arm = 1)       # Training group
+unexposed <- Odat_counting_weights %>% mutate(arm = 0)     # Control group
 
 # predict both outcomes for each patient
 pred_exposed <- survfit(cox_weighted, newdata = exposed) 
@@ -397,10 +283,8 @@ mcf_marginal_unweighted%>%
 
 # combine both results in table
 comparison_table <- bind_rows(
-  extract_model_results(cox_unweighted,  "1: Naive (Unweighted)",     true_beta_marginal, true_beta_nodeath),
-  extract_model_results(cox_falls,       "2: LWYY + IPCW falls",      true_beta_marginal, true_beta_nodeath),
-  extract_model_results(cox_weighted,    "3: LWYY + IPCW proxy",      true_beta_marginal, true_beta_nodeath),
-  extract_model_results(cox_oracle,      "4: LWYY + IPCW oracle",     true_beta_marginal, true_beta_nodeath)
+  extract_model_results(cox_unweighted, "1: Naive (Unweighted)", true_beta = true_beta_marginal),
+  extract_model_results(cox_weighted,   "2: LWYY + IPCW",        true_beta = true_beta_marginal)
 )
 
 # print
@@ -409,7 +293,7 @@ print(comparison_table)
 
 comparison_table_dgp <- bind_rows(
   extract_model_results(cox_unweighted, "1: Naive (Unweighted)", true_beta = true_beta_dgp),
-  extract_model_results(cox_weighted,   "3: LWYY + IPCW proxy",  true_beta = true_beta_dgp)   # GEÄNDERT: Name
+  extract_model_results(cox_weighted,   "2: LWYY + IPCW",        true_beta = true_beta_dgp)
 )
 cat("\nZum Vergleich -- Bias gegen konditionalen DGP-Parameter (nicht empfohlen als Hauptmass):\n")
 print(comparison_table_dgp)
@@ -421,7 +305,7 @@ print(comparison_table_dgp)
 # Cumulated falls over time
 Odat %>%
   group_by(ID) %>%
-  mutate(cum_y = cumsum(Yrep)) %>%          # GEÄNDERT: berichtete Stürze
+  mutate(cum_y = cumsum(Yobs)) %>%
   group_by(arm, t) %>%
   summarise(mean_cum_y = mean(cum_y), .groups = "drop") %>%
   ggplot(aes(x = t, y = mean_cum_y, color = factor(arm))) +
@@ -467,7 +351,7 @@ Odat %>%
   filter(ID %in% sample_ids) %>%
   ggplot(aes(x = t, y = factor(ID), group = ID)) +
   geom_line(color = "grey70", linewidth = 0.8) +
-  geom_point(data = . %>% filter(Yrep == 1), aes(color = "Sturz"), size = 2) +   # GEÄNDERT: berichtete Stürze
+  geom_point(data = . %>% filter(Yobs == 1), aes(color = "Sturz"), size = 2) +
   geom_point(data = . %>% filter(status == 2), aes(color = "Dropout"), shape = 4, size = 3, stroke = 1.5) +
   scale_color_manual(values = c("Sturz" = "#D55E00", "Dropout" = "black")) +
   labs(
