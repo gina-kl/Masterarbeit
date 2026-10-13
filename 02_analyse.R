@@ -1,444 +1,241 @@
 ###############################################################################
-### Analysis for Scenario 1 with the Time-Varying Covariate Measured Weekly ###
+### Analysis of ONE simulated data set
+### - Section 0: Settings, data and true values
 ### - Section 1: Data Preparation
 ### - Section 2: Summary Statistics
 ### - Section 3: Estimation of Weights
-### - Section 4: Fit LWYY 
-### - Section 5: Calculate Mean number of falls
-### - Section 6: Collect and Save Results
+### - Section 4: Fit models (LWYY and Ghosh-Lin)
+### - Section 5: Mean number of falls (nonparametric, weighted)
+### - Section 6: Collect results
 ###############################################################################
 
+
 ## Load necessary libraries
-library(ipw)         # Inverse Probability Weighting
-library(MASS)        # For fitting negative binomial models
 library(tidyverse)   # Data manipulation and visualization
 library(magrittr)    # Pipe operators and utilities
-library(survival)    # Recurrent event analysis
-library(mets)        # For Gosh-Lin Model
-library(splines)     # For time-dependent weights in ipw
+library(survival)    # LWYY (coxph)
+library(mets)        # Ghosh-Lin (recreg)
+library(ipw)         # Inverse Probability Weighting (ipwtm)
+library(splines)     # ns() in the weight models
 
 # functions
-source("functions.R")
+source("functions.R")   
 
 # Constants
-n_pts <- 2778        # Total number of patients (both arms)
-nboot <- 1000        # Number of bootstrap samples
-trunc_level <- 0.01  # IPW truncation: weights below 1st / above 99th percentile are set to these percentiles
+t_end <- 52
 
-# Load simulated data
-current_file <- "./results/Odat_scen14_run001.rds"
-Odat_all <- readRDS(current_file)   
+#####################################################
+#----------- Section 0: Data and true values -------#
+#####################################################
+current_file <- "./results/Odat_scen48_run0001.rds"
+Odat_all <- readRDS(current_file)
 
-# load log data and true estimands
 sim_log <- read_csv("./results/00_simulation_log.csv", show_col_types = FALSE)
 true_estimands <- read_csv("./results/00_true_estimands.csv", show_col_types = FALSE)
 
-# später schleife über sim_log
-current_params <- sim_log %>% 
-  filter(file_path == current_file)
-true_beta_dgp <- current_params$true_beta_arm[1] # true beta from data generation process
+current_params <- sim_log %>% filter(file_path == current_file)
 
-# select true marginal effect
-true_beta_marginal <- true_estimands %>%
-  filter(
-    Scenario_Name == current_params$scenario_name[1],
-    Mortality     == current_params$mortality_level[1],
-    True_Beta_Arm == current_params$true_beta_arm[1]
-  ) %>%
-  pull(True_LogRateRatio)
+# true values per method (one row per causal scenario)
+truth <- true_estimands %>%
+  filter(Scenario_Name == current_params$scenario_name[1],
+         Mortality     == current_params$mortality_level[1],
+         True_Beta_Arm == current_params$true_beta_arm[1])
+if (nrow(truth) != 1) stop("true values not found (or not unique) in 00_true_estimands.")
 
-if (length(true_beta_marginal) != 1) {
-  stop("not found in 00_true_estimands.")
-}
-
-# true value without death (for LWYY)
-true_beta_nodeath <- true_estimands %>%
-  filter(
-    Scenario_Name == current_params$scenario_name[1],
-    Mortality     == current_params$mortality_level[1],
-    True_Beta_Arm == current_params$true_beta_arm[1]
-  ) %>%
-  pull(True_LogRateRatio_NoDeath)
-
-# data generation parameter and marginal parameter
-cat("conditional DGP-Parameter (true_beta_arm):", true_beta_dgp, "\n")
-cat("marginal true beta (True_LogRateRatio):    ", true_beta_marginal, "\n")
-cat("marginal true beta without death:          ", true_beta_nodeath, "\n")
-
-# method depends on mortality: LWYY only for low, Ghosh-Lin only for high mortality
-method <- ifelse(current_params$mortality_level[1] == "low", "LWYY", "GL")
-cat("Method:", method, "\n")
-
+cat("conditional DGP parameter (true_beta_arm):", current_params$true_beta_arm[1], "\n")
+cat("True_Beta_LWYY:   ", truth$True_Beta_LWYY, "\n")
+cat("True_Beta_GL:     ", truth$True_Beta_GL, "\n")
+cat("True_LogRateRatio:", truth$True_LogRateRatio, "(ratio of mean falls)\n")
 
 
 #####################################################
 #----------- Section 1: Data Preparation -----------#
 #####################################################
-# observed data in the study
-Odat <- Odat_all %>% filter(observed)
+# columns from the data generation:
+# observed, n_falls, n_falls_full, drop, death, death_full, cum_falls_lag, train_rate_lag, frailty_t
+Odat_all <- Odat_all %>%
+# log_base_falls = log(1 + falls in the year before)
+# The difference becomes smaller as the number of iterations increases, if the values are too high, recreg does not converge
+  mutate(log_base_falls = log1p(base_risk),                       # log(1 + falls in the year before)
+         tstop         = t,                                     # time variable for the weight models
+         fall_rate_lag  = cum_falls_lag / pmax(t - 1, 1)) %>%    # observed fall rate up to week t-1
+  arrange(ID, t)
 
-# complete data for oracle M0 (no dropout, no random censoring, only death or t.end)
-Odat_full <- Odat_all %>%
-  filter(t != 0) %>%
-  mutate(tstart = t - 1, tstop = t) %>%
-  as.data.frame()
-
-
-
-Odat_prepared <- Odat %>%
-  group_by(ID) %>%
-  mutate(
-    ttl_events_pts = sum(Yrep, na.rm = TRUE), # Sum of reported events per patient
-    ttl_time_pts = max(t)                     # Maximum follow-up time
-  ) %>%
-  ungroup()
+Odat <- Odat_all %>% filter(observed)                            # observed data in the study
 
 
 #######################################################
 #----------- Section 2: Summary Statistics -----------#
 #######################################################
-
-# Summary stats for the actual observed data (with informative dropout)
-summary_stat_obs <- Odat_prepared %>%
-  group_by(ID) %>%
-  slice(1) %>%  # Select the first record for each patient
-  ungroup() %>%
-  group_by(arm) %>%                            # In each arm, calculate:
-  mutate(
-    total_pts = n(),                           # Total number of patients 
-    total_dropouts = sum(ever_dropped),        # Number of patients who dropped out
-    ttl_events_arm = sum(ttl_events_pts),      # Total events in the group
-    ttl_time_arm = sum(ttl_time_pts),          # Total follow-up time in the group
-    event_rate_arm = 52 * ttl_events_arm / ttl_time_arm,  # Annualized event rate (52 weeks)
-    avg_evts = ttl_events_arm / total_pts,     # Average events per patient
-    dropout_prop = total_dropouts / total_pts, # Proportion of dropouts
-    avg_time = ttl_time_arm / total_pts        # Average follow-up time per patient
-  ) %>%
-  slice(1) %>%  # Retain one row per treatment arm
-  ungroup() %>%
-  dplyr::select(arm, total_pts, total_dropouts, dropout_prop, ttl_events_arm, ttl_time_arm, event_rate_arm, avg_evts, avg_time)
-
+# observed data (with informative dropout)
+summary_stat_obs <- Odat %>%
+  group_by(arm, ID) %>%
+  summarise(falls = sum(n_falls), weeks = n(), dropped = max(drop), died = max(death), .groups = "drop") %>%
+  group_by(arm) %>%
+  summarise(total_pts      = n(),
+            total_dropouts = sum(dropped),
+            dropout_prop   = mean(dropped),
+            deaths_obs     = sum(died),
+            ttl_events_arm = sum(falls),
+            ttl_time_arm   = sum(weeks),
+            event_rate_arm = 52 * ttl_events_arm / ttl_time_arm,   # annualised event rate
+            avg_evts       = ttl_events_arm / total_pts,
+            avg_time       = ttl_time_arm / total_pts)
 print(summary_stat_obs)
 
 # proportion of all falls (complete data) that is observed in the study
 summary_stat_full <- Odat_all %>%
   group_by(arm) %>%
-  summarise(
-    falls_full = sum(Yfull),                        # all falls
-    falls_observed = sum(Yobs[observed]),           # falls observed in study
-    prop_observed = falls_observed / falls_full,
-    falls_per_pt_full = falls_full / n_distinct(ID)
-  )
-
+  summarise(falls_full        = sum(n_falls_full),
+            falls_observed    = sum(n_falls, na.rm = TRUE),
+            prop_observed     = falls_observed / falls_full,
+            falls_per_pt_full = falls_full / n_distinct(ID))
 print(summary_stat_full)
 
 
 ##########################################################
 #----------- Section 3: Estimation of Weights -----------#
 ##########################################################
+# Stabilised weights with ipwtm, estimated separately per arm.
+#   numerator  : baseline covariates + time (the same covariates are in the outcome model)
+#   denominator: numerator + proxies (sym, sym_train) or true frailty (oracle)
+# two corrections around ipwtm:
+#   1) ipwtm is fitted on weeks WITHOUT death (dropout only possible if the person survives the week)
+#   2) lag_ipw(): the weight for week t is the ipwtm weight of week t-1, because the falls of
+#      week t are observed before a dropout at the end of week t
+# Unstabilised weights (ipwtm without numerator) are needed for the mean number of falls (Section 5).
 
-# Prepare counting process data for weight estimation
-# tstart and tstop are required
-Odat_counting <- Odat_prepared %>%
-  group_by(ID) %>% 
-  filter(t != 0) %>%  # Exclude the baseline (t = 0)
-  mutate(
-    tstart = t - 1,                # Start time of each interval 
-    tstop = t,                     # Stop time of each interval
-    dropout_event = ifelse(!is.na(dropout_time) & dropout_time == tstop, 1, 0), # Event indicator for Dropout
-    cum_events = lag(cumsum(Yrep)),               # reported falls (lag = until week t-1)
-    cum_events = replace_na(cum_events, 0),
-    cumTrain_lag = lag(CumTrain),                 # number of trainings (lag = until week t-1)
-    cumTrain_lag = replace_na(cumTrain_lag, 0),
-    fall_rate_lag    = cum_events     / pmax(tstart, 1),  # fall rate per week
-    train_rate_lag   = cumTrain_lag   / pmax(tstart, 1),
-    base_fall_rate   = base_risk / 52         # baseline fall rate per week 
-  ) %>%
-  ungroup() %>% 
-  as.data.frame()   
-
-# split data for weights calculation
-
-Odat_arm0 <- subset(Odat_counting, arm == 0)
-Odat_arm1 <- subset(Odat_counting, arm == 1)
-
-# 4 different weights:
-#  - falls:     only (reported) falls as proxy
-#  - sym:       falls + baseline fall rate, same model in both arms (symmetric proxy)
-#  - sym_train: sym + training rate in treatment arm (control arm: same as sym)
-#               ->asymmetric proxy
-#  - oracle:    true Frailty (not possible, only to see what's possible)
-#
-# ns(tstop, df = 3) : later rates are more important, because more information, only 3 parameter
-# for three months intervals later factor() instead of ns()
-# base_fall_rate is time-constant -> only main effect, no interaction with ns(tstop)
-# base_fall_rate only in denominator (in numerator it would have to be in the outcome model too)
-
-# Control group: falls
-ipw_arm0_falls <- ipwtm(
-  exposure = dropout_event,
-  family = "binomial",
-  link = "logit",
-  numerator = ~ age + sex + ns(tstop, df = 3),
-  denominator = ~ age + sex + ns(tstop, df = 3) * fall_rate_lag,
-  id = ID,
-  tstart = tstart,  # is ignored with family "binomial"
-  timevar = tstop,
-  type = "cens",
-  data = Odat_arm0
-)
-
-# Control group:falls and baseline fall rate
-ipw_arm0_sym <- ipwtm(
-  exposure = dropout_event,
-  family = "binomial",
-  link = "logit",
-  numerator = ~ age + sex + ns(tstop, df = 3),
-  denominator = ~ age + sex + base_fall_rate + ns(tstop, df = 3) * fall_rate_lag,
-  id = ID,
-  tstart = tstart,
-  timevar = tstop,
-  type = "cens",
-  data = Odat_arm0
-)
-
-# Control group: oracle
-ipw_arm0_oracle <- ipwtm(
-  exposure = dropout_event,
-  family = "binomial",
-  link = "logit",
-  numerator = ~ age + sex + ns(tstop, df = 3),
-  denominator = ~ age + sex + ns(tstop, df = 3) + frailty,
-  id = ID,
-  tstart = tstart,
-  timevar = tstop,
-  type = "cens",
-  data = Odat_arm0
-)
-
-# Training group: falls
-ipw_arm1_falls <- ipwtm(
-  exposure = dropout_event,
-  family = "binomial",
-  link = "logit",
-  numerator = ~ age + sex + ns(tstop, df = 3),
-  denominator = ~ age + sex + ns(tstop, df = 3) * fall_rate_lag,
-  id = ID,
-  tstart = tstart,
-  timevar = tstop,
-  type = "cens",
-  data = Odat_arm1
-)
-
-# Training group: falls and baseline fall rate
-ipw_arm1_sym <- ipwtm(
-  exposure = dropout_event,
-  family = "binomial",
-  link = "logit",
-  numerator = ~ age + sex + ns(tstop, df = 3),
-  denominator = ~ age + sex + base_fall_rate + ns(tstop, df = 3) * fall_rate_lag,
-  id = ID,
-  tstart = tstart,
-  timevar = tstop,
-  type = "cens",
-  data = Odat_arm1
-)
-
-# Training group: falls, baseline fall rate and training
-ipw_arm1_symtrain <- ipwtm(
-  exposure = dropout_event,
-  family = "binomial",
-  link = "logit",
-  numerator = ~ age + sex + ns(tstop, df = 3),
-  denominator = ~ age + sex + base_fall_rate + ns(tstop, df = 3) * (fall_rate_lag + train_rate_lag),
-  id = ID,
-  tstart = tstart,
-  timevar = tstop,
-  type = "cens",
-  data = Odat_arm1
-)
-
-# Training group: oracle
-ipw_arm1_oracle <- ipwtm(
-  exposure = dropout_event,
-  family = "binomial",
-  link = "logit",
-  numerator = ~ age + sex + ns(tstop, df = 3),
-  denominator = ~ age + sex + ns(tstop, df = 3) + frailty,
-  id = ID,
-  tstart = tstart,
-  timevar = tstop,
-  type = "cens",
-  data = Odat_arm1
-)
-
-# truncation as extra function, because in simulation as variable. Not possible in trunc in ipw
-# evtl trunc_level auf 0.005
-Odat_arm0$w_falls       <- trunc_weights(ipw_arm0_falls$ipw.weights, trunc_level)
-Odat_arm0$w_sym         <- trunc_weights(ipw_arm0_sym$ipw.weights, trunc_level)
-Odat_arm0$w_symtrain    <- Odat_arm0$w_sym     # no training in control arm -> same as sym
-Odat_arm0$w_oracle      <- trunc_weights(ipw_arm0_oracle$ipw.weights, trunc_level)
-
-Odat_arm1$w_falls       <- trunc_weights(ipw_arm1_falls$ipw.weights, trunc_level)
-Odat_arm1$w_sym         <- trunc_weights(ipw_arm1_sym$ipw.weights, trunc_level)
-Odat_arm1$w_symtrain    <- trunc_weights(ipw_arm1_symtrain$ipw.weights, trunc_level)
-Odat_arm1$w_oracle      <- trunc_weights(ipw_arm1_oracle$ipw.weights, trunc_level)
+Odat_w <- compute_weights(Odat)
 
 
-Odat_counting_weights <- bind_rows(Odat_arm0, Odat_arm1) %>%
-  arrange(ID, tstop) %>%
-  mutate(weights_cens = w_sym) %>%    
-  as.data.frame()
 
-# check ipw weights for plausibility
-cat("\nDistribution of IPCW-weights before truncation:\n")
-print(summary(data.frame(
-  w_falls    = c(ipw_arm0_falls$ipw.weights,  ipw_arm1_falls$ipw.weights),
-  w_sym      = c(ipw_arm0_sym$ipw.weights,    ipw_arm1_sym$ipw.weights),
-  w_symtrain = c(ipw_arm0_sym$ipw.weights,    ipw_arm1_symtrain$ipw.weights),
-  w_oracle   = c(ipw_arm0_oracle$ipw.weights, ipw_arm1_oracle$ipw.weights)
-)))
-cat("\nDistribution of IPCW-weights after truncation (used in models):\n")
-print(summary(Odat_counting_weights[, c("w_falls", "w_sym", "w_symtrain", "w_oracle")]))
-cat("Number of weights > 10 (sym):      ", sum(Odat_counting_weights$w_sym > 10), "\n")
-cat("Number of weights > 20 (sym):      ", sum(Odat_counting_weights$w_sym > 20), "\n")
-cat("Number of weights > 10 (sym_train):", sum(Odat_counting_weights$w_symtrain > 10), "\n")
-cat("Number of weights > 20 (sym_train):", sum(Odat_counting_weights$w_symtrain > 20), "\n")
+# check weights for plausibility
+cat("\nStabilised weights (used in models):\n")                
+print(summary(Odat_w[, c("w_sym", "w_symtrain", "w_oracle")]))
 
+# mean of the stabilised weights per arm and week should be ~1 
+weight_check <- Odat_w %>%
+  group_by(arm, t) %>%
+  summarise(across(c(w_sym, w_symtrain, w_oracle), mean), .groups = "drop") %>%
+  group_by(arm) %>%
+  summarise(across(c(w_sym, w_symtrain, w_oracle), ~ paste(round(range(.x), 2), collapse = " - ")))
+cat("\nRange of weekly mean weights per arm (should be close to 1):\n"); print(weight_check)
+
+ess <- Odat_w %>%
+  group_by(arm) %>%
+  summarise(across(c(w_sym, w_symtrain, w_oracle), ~ sum(.x)^2 / sum(.x^2) / n()))
+cat("\nEffective sample size relative to n person-weeks:\n"); print(ess)
 
 
 ###########################################################
 #----------- Section 4: Fit models -----------------------#
 ###########################################################
-# mortality low: LWYY, mortality high: Ghosh-Lin
-# M0 (complete data, oracle) added for both
-# ties = "breslow": because of possible ties (with poi~falls normally no ties left)
 
-if (method == "LWYY") {
+# counting-process data for LWYY and Ghosh-Lin with prep_counting(): falls of the death / dropout week
+# are kept, weights are carried along per week
+cp      <- prep_counting(Odat_w, "observed")        # observed data incl. weights
+cp_full <- prep_counting(Odat_all, "full")          # complete data (oracle M0)
 
-  # not include week of death/dropout (status =2 or 3)
-  # only status 0/1 left
-  set.seed(1)   
-  Odat_lwyy <- Odat_counting_weights %>% filter(status %in% c(0, 1)) %>%
-    expand_falls("status", "Yrep")
-  Odat_lwyy_full <- Odat_full %>% filter(status_full %in% c(0, 1)) %>%
-    expand_falls("status_full", "Yfull")  
+# --- LWYY (death = censoring) ---------------------------------------------------
+f_lwyy <- Surv(start, stop, status == 1) ~ arm + age + sex + log_base_falls + cluster(ID)
 
-  # LWYY on complete data (oracle)
-  fit_full <- coxph(Surv(tstart, tstop, status_full) ~ arm + age + sex + cluster(ID),
-                    data = Odat_lwyy_full, ties = "breslow", robust = TRUE)
-  # LWYY without IPW
-  fit_naive <- coxph(Surv(tstart, tstop, status) ~ arm + age + sex + cluster(ID),
-                     data = Odat_lwyy, ties = "breslow", robust = TRUE)
-  # LWYY + IPW (falls)
-  fit_falls <- coxph(Surv(tstart, tstop, status) ~ arm + age + sex + cluster(ID),
-                     data = Odat_lwyy, weights = w_falls, ties = "breslow", robust = TRUE)
-  # LWYY + IPW (falls + baseline fall rate)
-  fit_sym <- coxph(Surv(tstart, tstop, status) ~ arm + age + sex + cluster(ID),
-                   data = Odat_lwyy, weights = w_sym, ties = "breslow", robust = TRUE)
-  # LWYY + IPW (falls + baseline fall rate + Trainings)
-  fit_symtrain <- coxph(Surv(tstart, tstop, status) ~ arm + age + sex + cluster(ID),
-                        data = Odat_lwyy, weights = w_symtrain, ties = "breslow", robust = TRUE)
-  # LWYY + IPW (oracle)
-  fit_oracle <- coxph(Surv(tstart, tstop, status) ~ arm + age + sex + cluster(ID),
-                      data = Odat_lwyy, weights = w_oracle, ties = "breslow", robust = TRUE)
-}
+lwyy_full     <- coxph(f_lwyy, data = cp_full, ties = "breslow")
+lwyy_naive    <- coxph(f_lwyy, data = cp,      ties = "breslow")
+lwyy_sym      <- coxph(f_lwyy, data = cp,      ties = "breslow", weights = w_sym)
+lwyy_symtrain <- coxph(f_lwyy, data = cp,      ties = "breslow", weights = w_symtrain)
+lwyy_oracle   <- coxph(f_lwyy, data = cp,      ties = "breslow", weights = w_oracle)
 
-if (method == "GL") {
+# --- Ghosh-Lin (death = terminal event) -----------------------------------------
+# fitted in all scenarios, without death GL = LWYY
+# NOTE: whether recreg handles row-specific (time-varying) weights correctly is not yet
+#       verified -> compare with the nonparametric mean number of falls in Section 5
+f_gl <- Event(start, stop, status) ~ arm + age + sex + log_base_falls + cluster(ID)
 
-  # data in the form recreg needs 
-  set.seed(1)  
-  Odat_gl <- prep_gl_data(expand_falls(Odat_counting_weights, "status", "Yrep"),
-                               status_col = "status")
-  Odat_gl_full <- prep_gl_data(expand_falls(Odat_full, "status_full", "Yfull"),
-                               status_col = "status_full")
-
-  # Ghosh-Lin on complete data (oracle)
-  fit_full <- recreg(Event(tstart, tstop, status_gl) ~ arm + age + sex + cluster(ID),
-                     data = Odat_gl_full, cause = 1, death.code = 3, cens.code = 0)
-  # Ghosh-Lin without IPW
-  fit_naive <- recreg(Event(tstart, tstop, status_gl) ~ arm + age + sex + cluster(ID),
-                      data = Odat_gl, cause = 1, death.code = 3, cens.code = 0)
-  # Ghosh-Lin + IPW (falls)
-  fit_falls <- recreg(Event(tstart, tstop, status_gl) ~ arm + age + sex + cluster(ID),
-                      data = Odat_gl, cause = 1, death.code = 3, cens.code = 0,
-                      weights = Odat_gl$w_falls)
-  # Ghosh-Lin + IPW (falls + baseline fall rate)
-  fit_sym <- recreg(Event(tstart, tstop, status_gl) ~ arm + age + sex + cluster(ID),
-                    data = Odat_gl, cause = 1, death.code = 3, cens.code = 0,
-                    weights = Odat_gl$w_sym)
-  # Ghosh-Lin + IPW (falls + baseline fall rate + Trainings)
-  fit_symtrain <- recreg(Event(tstart, tstop, status_gl) ~ arm + age + sex + cluster(ID),
-                         data = Odat_gl, cause = 1, death.code = 3, cens.code = 0,
-                         weights = Odat_gl$w_symtrain)
-  # Ghosh-Lin + IPW (oracle)
-  fit_oracle <- recreg(Event(tstart, tstop, status_gl) ~ arm + age + sex + cluster(ID),
-                       data = Odat_gl, cause = 1, death.code = 3, cens.code = 0,
-                       weights = Odat_gl$w_oracle)
-}
+# cens.model = ~ strata(arm):  recreg weights the persons who died with the censoring
+#   probabilities G_c (Kaplan-Meier from the rows with status 0, ?recreg: "Formula for a stratified Cox model
+#   without covariates used to estimate censoring probabilities"). Default ~1 = one Kaplan-Meier for both arms;
+#   dropout differs strongly between the arms -> one Kaplan-Meier per arm, as for the IPCW models (per arm)
+#   and as in the example of ?recreg ("censoring stratified after treatment").
+#   The IPCW weights (weights = ...) are a different correction: informative dropout given the history.
+gl_full     <- recreg(f_gl, data = cp_full, cause = 1, death.code = 3, cens.code = 0, cens.model = ~ strata(arm))
+gl_naive    <- recreg(f_gl, data = cp,      cause = 1, death.code = 3, cens.code = 0, cens.model = ~ strata(arm))
+gl_sym      <- recreg(f_gl, data = cp,      cause = 1, death.code = 3, cens.code = 0, cens.model = ~ strata(arm), weights = cp$w_sym)
+gl_symtrain <- recreg(f_gl, data = cp,      cause = 1, death.code = 3, cens.code = 0, cens.model = ~ strata(arm), weights = cp$w_symtrain)
+gl_oracle   <- recreg(f_gl, data = cp,      cause = 1, death.code = 3, cens.code = 0, cens.model = ~ strata(arm), weights = cp$w_oracle)
 
 
 
 #############################################################
-#----- Section 5: Calculate mean number of falls -----------#
+#----- Section 5: Mean number of falls (nonparametric) -----#
 #############################################################
-# Use G computation to compute mean number of falls
-# only for LWYY (survfit needs a coxph model) TODO: Gosh-Lin
-
-if (method == "LWYY") {
-
-  # one row per patient
-  baseline_pts <- Odat_counting_weights %>% distinct(ID, age, sex)
-  exposed   <- baseline_pts %>% mutate(arm = 1)     # Training group
-  unexposed <- baseline_pts %>% mutate(arm = 0)     # Control group
-  
-
-  fits <- list("0: Full data (oracle M0)" = fit_full,
-               "1: Naive (Unweighted)"    = fit_naive,
-               "2: IPCW falls"            = fit_falls,
-               "3: IPCW sym"              = fit_sym,
-               "4: IPCW sym_train"        = fit_symtrain,
-               "5: IPCW oracle"           = fit_oracle)
-  
-  mean_falls_table <- map_dfr(names(fits), function(m) {
-    pred_exposed   <- survfit(fits[[m]], newdata = exposed, se.fit = FALSE)   # se.fit= FALSE for faster computation
-    pred_unexposed <- survfit(fits[[m]], newdata = unexposed, se.fit = FALSE)
-    
-    data.frame(
-      time           = pred_exposed$time,
-      mean_exposed   = rowMeans(pred_exposed$cumhaz),
-      mean_unexposed = rowMeans(pred_unexposed$cumhaz)
-    ) %>%
-      filter(time <= 52) %>%
-      tail(1) %>%
-      mutate(Model      = paste(method, m),
-             difference = mean_exposed - mean_unexposed,
-             rate_ratio = mean_exposed / mean_unexposed)
-  })
-  
-  print(mean_falls_table)
-}
-
-
-#############################################################
-# ----- Section 6: Extract results -------------------------#
-############################################################
-
-
-# combine both results in table
-# fit_* for LWYY or GL, M0 added, method in model name
-comparison_table <- bind_rows(
-  extract_model_results(fit_full,     paste(method, "0: Full data (oracle M0)"), true_beta_marginal, true_beta_nodeath),
-  extract_model_results(fit_naive,    paste(method, "1: Naive (Unweighted)"),    true_beta_marginal, true_beta_nodeath),
-  extract_model_results(fit_falls,    paste(method, "2: IPCW falls"),            true_beta_marginal, true_beta_nodeath),
-  extract_model_results(fit_sym,      paste(method, "3: IPCW sym"),              true_beta_marginal, true_beta_nodeath),
-  extract_model_results(fit_symtrain, paste(method, "4: IPCW sym_train"),        true_beta_marginal, true_beta_nodeath),
-  extract_model_results(fit_oracle,   paste(method, "5: IPCW oracle"),           true_beta_marginal, true_beta_nodeath)
+# MCF for LWYY
+#   mu_a(52) = sum_t S_a(t-1) * dR_a(t), weighted Nelson-Aalen + weighted Kaplan-Meier per arm
+#   true values: MCF_Control, MCF_Intervention, True_LogRateRatio
+mcf_list <- list(
+  "0: Full data (oracle M0)" = weighted_mcf(Odat_all %>% mutate(w1 = 1), "w1", "n_falls_full", "death_full"),
+  "1: Naive (Unweighted)"    = weighted_mcf(Odat_w %>% mutate(w1 = 1), "w1"),
+  "3: IPCW sym"              = weighted_mcf(Odat_w, "wm_sym"),
+  "4: IPCW sym_train"        = weighted_mcf(Odat_w, "wm_symtrain"),
+  "5: IPCW oracle"           = weighted_mcf(Odat_w, "wm_oracle")
 )
 
-# print
+
+# baseline covariates, one row per person (for the standardised model-based MCFs)
+base_cov <- Odat_all %>% filter(t == 1) %>% dplyr::select(ID, age, sex, log_base_falls)
+
+gl_list   <- list("0: Full data (oracle M0)" = gl_full,   "1: Naive (Unweighted)" = gl_naive,
+                  "3: IPCW sym" = gl_sym,   "4: IPCW sym_train" = gl_symtrain,   "5: IPCW oracle" = gl_oracle)
+lwyy_list <- list("0: Full data (oracle M0)" = lwyy_full, "1: Naive (Unweighted)" = lwyy_naive,
+                  "3: IPCW sym" = lwyy_sym, "4: IPCW sym_train" = lwyy_symtrain, "5: IPCW oracle" = lwyy_oracle)
+
+
+# table: nonparametric, GL- and LWYY-based MCF with the matching true values
+# function to compute mcf lwyy and gl see function.R
+mean_falls_table <- bind_rows(
+  imap_dfr(mcf_list, function(m, name)
+    tibble(Model = paste("MCF", name), MCF_Control = m$MCF[m$arm == 0], MCF_Intervention = m$MCF[m$arm == 1])),
+  imap_dfr(gl_list, function(fit, name) {
+    mu <- model_mcf(fit, base_cov, t_end)
+    tibble(Model = paste("MCF-GL", name), MCF_Control = mu[1], MCF_Intervention = mu[2])
+  }),
+  imap_dfr(lwyy_list, function(fit, name) {
+    mu <- model_mcf(fit, base_cov, t_end)
+    tibble(Model = paste("MCF-LWYY", name), MCF_Control = mu[1], MCF_Intervention = mu[2])
+  })
+) %>%
+  mutate(no_death              = startsWith(Model, "MCF-LWYY"),   # LWYY: hypothetical world without death
+         True_MCF_Control      = if_else(no_death, truth$MCF_Control_NoDeath,       truth$MCF_Control),
+         True_MCF_Intervention = if_else(no_death, truth$MCF_Intervention_NoDeath,  truth$MCF_Intervention),
+         True_LogRatio         = if_else(no_death, truth$True_LogRateRatio_NoDeath, truth$True_LogRateRatio),
+         Bias_MCF_Control      = MCF_Control - True_MCF_Control,
+         Bias_MCF_Intervention = MCF_Intervention - True_MCF_Intervention,
+         Log_Ratio             = log(MCF_Intervention / MCF_Control),
+         Bias                  = Log_Ratio - True_LogRatio) %>%
+  dplyr::select(-no_death)
+print(mean_falls_table)
+
+
+
+
+
+#############################################################
+# ----- Section 6: Collect results -------------------------#
+#############################################################
+comparison_table <- bind_rows(
+  extract_model_results(lwyy_full,     "LWYY 0: Full data (oracle M0)", truth$True_Beta_LWYY),
+  extract_model_results(lwyy_naive,    "LWYY 1: Naive (Unweighted)",    truth$True_Beta_LWYY),
+  extract_model_results(lwyy_sym,      "LWYY 3: IPCW sym",              truth$True_Beta_LWYY),
+  extract_model_results(lwyy_symtrain, "LWYY 4: IPCW sym_train",        truth$True_Beta_LWYY),
+  extract_model_results(lwyy_oracle,   "LWYY 5: IPCW oracle",           truth$True_Beta_LWYY),
+  extract_model_results(gl_full,       "GL 0: Full data (oracle M0)",   truth$True_Beta_GL),
+  extract_model_results(gl_naive,      "GL 1: Naive (Unweighted)",      truth$True_Beta_GL),
+  extract_model_results(gl_sym,        "GL 3: IPCW sym",                truth$True_Beta_GL),
+  extract_model_results(gl_symtrain,   "GL 4: IPCW sym_train",          truth$True_Beta_GL),
+  extract_model_results(gl_oracle,     "GL 5: IPCW oracle",             truth$True_Beta_GL)
+) %>%
+  mutate(scenario_id = current_params$scenario_id[1],      # for the loop over all files
+         sim_run     = current_params$sim_run[1],
+         file_path   = current_file)
+
 print(comparison_table)
-
-
-
 
