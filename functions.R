@@ -2,14 +2,15 @@
 ### Function ##################################################################
 ### - Section 1: Data preparation
 ### - Section 2: Function for analyse
+### - Section 3: weights and MCF
+### - Section 4: Bootstrap
 ###############################################################################
 
-############ Section 1: Data preparation
+#------------- Section 1: Data preparation -----------------------------------
 
 # Prepare counting-process data for true model
 # complete data -> one row per interval between falls 
-# k falls in week t are placed at t-1 + j/(k+d), j = 1..k (d = 1 if death at the end of week t),
-# i.e. inside week t as in expand_counting(); status: 1 = fall, 3 = death, 0 = end of study
+# k falls in week t are placed at t-1 + j/(k+d), j = 1..k (d = 1 if death at the end of week t)
 prep_data_true <- function(dat, t.end = 52) {
   base <- dat %>%
     filter(t == 0) %>%
@@ -63,9 +64,9 @@ prep_counting <- function(dat, data = c("observed", "full")) {
   }
   cp <- d %>%
     arrange(ID, t) %>%
-    mutate(m = pmax(1L, as.integer(k + term_death + term_drop))) %>%
-    tidyr::uncount(m, .id = "j", .remove = FALSE) %>%
-    mutate(start = t - 1 + (j - 1) / m,
+    mutate(m = pmax(1L, as.integer(k + term_death + term_drop))) %>%  # number of falls and death or dropout event if nessesary
+    tidyr::uncount(m, .id = "j", .remove = FALSE) %>%  # duplicate rows for every event
+    mutate(start = t - 1 + (j - 1) / m,                # divide in parts
            stop  = t - 1 + j / m) %>%
     group_by(ID) %>%
     mutate(last_row = row_number() == n()) %>%
@@ -75,7 +76,7 @@ prep_counting <- function(dat, data = c("observed", "full")) {
                               last_row                 ~ 0L,   # dropout or end of study = censoring
                               TRUE                     ~ 9L))  # no event
   
-  # last row is a fall: short censoring row at the end of study
+  # last row is a fall: short censoring row at the end of study (administrative censoring)
   extra <- cp %>%
     filter(last_row & status == 1L) %>%
     mutate(start = stop, status = 0L)
@@ -88,8 +89,7 @@ prep_counting <- function(dat, data = c("observed", "full")) {
 }
 
 
-############ Section 2: Function for analyse
-
+#--------------- Section 2: Function for analyse --------------------------------
 
 
 
@@ -116,11 +116,41 @@ extract_model_results <- function(model, model_name, true_beta) {
   )
 }
 
+# fit models
+# Odat_all: complete dataset without dropout
+# Odat_w: obseved data set with ipcw weights (with compute weights)
+# same argument order as mcf_estimate(): fit_models(Odat_all, Odat_w)
+# fit LWYY and Gosh-Lin model with and without proxies
 
-############ Section 3: Weights and mean number of falls
+fit_models <- function(Odat_all, Odat_w){
+    cp      <- prep_counting(Odat_w, "observed")
+    cp_full <- prep_counting(Odat_all, "full")
+    
+    f_lwyy <- Surv(start, stop, status == 1) ~ arm + age + sex + log_base_falls + cluster(ID)
+    f_gl   <- Event(start, stop, status) ~ arm + age + sex + log_base_falls + cluster(ID)
+    
+    # GL: cens.model = ~ strata(arm) -> internal censoring Kaplan-Meier per arm
+    list(
+      "LWYY 0: Full data (oracle M0)" = coxph(f_lwyy, data = cp_full, ties = "breslow"),
+      "LWYY 1: Naive (Unweighted)"    = coxph(f_lwyy, data = cp, ties = "breslow"),
+      "LWYY 3: IPCW sym"              = coxph(f_lwyy, data = cp, ties = "breslow", weights = cp$w_sym),
+      "LWYY 4: IPCW sym_train"        = coxph(f_lwyy, data = cp, ties = "breslow", weights = cp$w_symtrain),
+      "LWYY 5: IPCW oracle"           = coxph(f_lwyy, data = cp, ties = "breslow", weights = cp$w_oracle),
+      "GL 0: Full data (oracle M0)"   = recreg(f_gl, data = cp_full, cause = 1, death.code = 3, cens.code = 0, cens.model = ~ strata(arm)),
+      "GL 1: Naive (Unweighted)"      = recreg(f_gl, data = cp, cause = 1, death.code = 3, cens.code = 0, cens.model = ~ strata(arm)),
+      "GL 3: IPCW sym"                = recreg(f_gl, data = cp, cause = 1, death.code = 3, cens.code = 0, cens.model = ~ strata(arm),
+                                               weights = cp$w_sym),
+      "GL 4: IPCW sym_train"          = recreg(f_gl, data = cp, cause = 1, death.code = 3, cens.code = 0, cens.model = ~ strata(arm),
+                                               weights = cp$w_symtrain),
+      "GL 5: IPCW oracle"             = recreg(f_gl, data = cp, cause = 1, death.code = 3, cens.code = 0, cens.model = ~ strata(arm),
+                                               weights = cp$w_oracle)
+    )
+}
+
+# ----------------- Section 3: Weights and mean number of falls -------------
 
 # Compute ipw weights
-# IPVW weights per arm (for 02_analyse_weekly.R. 03_mehrfach analyse and bootstrap)
+# IPCW weights per arm (for 02_analyse_weekly.R. 03_mehrfach analyse and bootstrap)
 # iptwm fitted on weeks without death, lag_ipw shifts weigths by one week (falls of week t are observed before a dropout at its end)
 # w_* stabilised weights, wm_* for marginal mean (only time in numerator)
 # dat: observed weekly data (observed == TRUE) with tstop, log_base_falls, fall_rate_lag, train_rate_lag, frailty_t
@@ -128,7 +158,7 @@ extract_model_results <- function(model, model_name, true_beta) {
 
 compute_weights <- function(dat){
   dat %>%
-    mutate(tstart = t - 1) %>%
+    mutate(tstart = t - 1) %>%    
     split(.$arm) %>%
     lapply(function(d_all){
       d_all <- d_all %>% arrange(ID, t) %>% as.data.frame()
@@ -142,6 +172,7 @@ compute_weights <- function(dat){
         timevar = tstop,
         type = "cens",
         data = d_fit))
+      
       w_oracle <- shift(ipwtm(exposure = drop, family = "binomial", link = "logit",
                            numerator = ~ age + sex + log_base_falls + ns(tstop, df = 3), 
                            denominator = ~ age + sex + log_base_falls + ns(tstop, df = 3) + frailty_t,   
@@ -189,8 +220,8 @@ compute_weights <- function(dat){
 
 
 # Weights from ipwtm() shifted by one week
-#   ipwtm() returns cumulative weights INCLUDING the current week (probability of no dropout
-#   at the end of week t). The falls of week t happen BEFORE a dropout at the end of week t,
+#   ipwtm() returns cumulative weights including the current week (probability of no dropout
+#   at the end of week t). The falls of week t happen before a dropout at the end of week t,
 #   so the weight for week t is the ipwtm weight of week t-1 (week 1: weight 1).
 #   ipwtm() is fitted on weeks without death (d_fit); a death week gets the weight of the
 #   week before, which is exactly what the shift does.
@@ -204,7 +235,7 @@ lag_ipw <- function(ipw_fit, d_fit, d_all) {
     right_join(d_all %>% dplyr::select(ID, t), by = c("ID", "t")) %>%
     arrange(ID, t) %>%
     group_by(ID) %>%
-    mutate(w = lag(w_cum, default = 1)) %>%
+    mutate(w = lag(w_cum, default = 1)) %>%   # shift by one entry
     ungroup() %>%
     pull(w)
 }
@@ -219,12 +250,10 @@ lag_ipw <- function(ipw_fit, d_fit, d_all) {
 # d: weekly data, one row per person and week at risk, columns arm, t, falls, death, weight
 weighted_mcf <- function(d, w = "w", falls = "n_falls", death = "death", t.end = 52) {
   d %>%
-    #  .dth instead of .d: R completes argument names that are a unique abbreviation,
-    #   ".d" was read as mutate's first argument ".data" -> error "Can't subset .data outside of a data mask"
     mutate(.w = .data[[w]], .y = .data[[falls]], .dth = .data[[death]]) %>%
     group_by(arm, t) %>%
-    summarise(dR = sum(.w * .y) / sum(.w),          # falls per person at risk in week t
-              hD = sum(.w * .dth) / sum(.w),        # death hazard in week t   
+    summarise(dR = sum(.w * .y) / sum(.w),          # fallsrate weighted
+              hD = sum(.w * .dth) / sum(.w),        # death hazard weighted
               .groups = "drop") %>%
     group_by(arm) %>%
     arrange(t, .by_group = TRUE) %>%
@@ -234,6 +263,24 @@ weighted_mcf <- function(d, w = "w", falls = "n_falls", death = "death", t.end =
               .groups = "drop")
 }
 
+
+# Mean number of falls up to qurter of year per arm (nonparametric Ghosh-Lin / Cook-Lawless, weighted)
+
+weighted_mcf_q <- function(d, w = "w", falls = "n_falls", death = "death", breaks =c(0,13,26,39,52)) {
+  d %>%
+    mutate(.w = .data[[w]], .y = .data[[falls]], .dth = .data[[death]]) %>%
+    group_by(arm, t) %>%
+    summarise(dR = sum(.w * .y) / sum(.w),          # fallsrate weighted
+              hD = sum(.w * .dth) / sum(.w),        # death hazard weighted
+              .groups = "drop") %>%
+    group_by(arm) %>%
+    arrange(t, .by_group = TRUE) %>%
+    mutate(S_lag = c(1, head(cumprod(1 - hD), -1)),        # alive at start of week t
+           q     = cut(t, breaks, labels = paste0("Q", seq_len(length(breaks) - 1)))) %>%   # cut at time points
+    filter(!is.na(q)) %>%
+    group_by(arm, q) %>%
+    summarise(MCF = sum(S_lag * dR), .groups = "drop")
+}
 
 
 
@@ -246,20 +293,90 @@ weighted_mcf <- function(d, w = "w", falls = "n_falls", death = "death", t.end =
 # LWYY (coxph):       Lambda_0(t) * exp(X beta) -> hypothetical world without death (compare with MCF_*_NoDeath),
 # only valid if death is independent of the falls given the covariates
 # log(MCF_1 / MCF_0) is exactly the coefficient of arm; new is only the level per arm
-# LWYY (coxph): Lambda_0(t) * exp(X beta) -> hypothetical world without death (compare with MCF_*_NoDeath),
+# basehaz with centered or not???
 model_mcf <- function(fit, base_cov, t.end = 52) {
   if (inherits(fit, "coxph")) {                              # LWYY
-    H0   <- basehaz(fit, centered = FALSE)                   # cumulative baseline rate Lambda_0(t)
-    H0_t <- max(H0$hazard[H0$time <= t.end])
+    H0   <- basehaz(fit, centered = TRUE)                    # Lambda_0(t) at the centering values zbar = fit$means
+    H0_t <- max(H0$hazard[H0$time <= t.end])                 # (centered = FALSE can over-/underflow, see ?basehaz)
     b    <- coef(fit)
+    zbar <- fit$means[names(b)]
     sapply(0:1, function(a) {
       X <- as.matrix(base_cov %>% mutate(arm = a) %>% dplyr::select(all_of(names(b))))
-      H0_t * mean(exp(X %*% b))
+      H0_t * mean(exp(sweep(X, 2, zbar) %*% b))              # Lambda_0(tau; zbar) * mean(exp((X_i - zbar) b))
     })
   } else {                                                   # Ghosh-Lin
     sapply(0:1, function(a)
       mean(predict(fit, newdata = base_cov %>% mutate(arm = a), times = t.end, se = FALSE)$cumhaz))
   }
+}
+
+# fits data prepared by fit_models()
+mcf_estimate <- function(Odat_all, Odat_w, fits){
+  # non-parametric estimate
+  mcf_list <- list(
+    "MCF 0: Full data (oracle M0)" = weighted_mcf(Odat_all %>% mutate(w1 = 1), "w1", "n_falls_full", "death_full"), # w1 = 1: unweighted, Estimate without dropout
+    "MCF 1: Naive (Unweighted)"    = weighted_mcf(Odat_w %>% mutate(w1 = 1), "w1"),
+    "MCF 3: IPCW sym"              = weighted_mcf(Odat_w, "wm_sym"),
+    "MCF 4: IPCW sym_train"        = weighted_mcf(Odat_w, "wm_symtrain"),
+    "MCF 5: IPCW oracle"           = weighted_mcf(Odat_w, "wm_oracle")
+  )
+  # estimated mean number of falls per arm (control, intervention):
+  # nonparametric (weighted_mcf) and model-based from all LWYY and GL fits (model_mcf, functions.R)
+  base_cov <- Odat_all %>% filter(t == 1) %>% dplyr::select(ID, age, sex, log_base_falls)   # one row per person
+  mcf_est <- c(
+    lapply(mcf_list, function(mm) c(mm$MCF[mm$arm == 0], mm$MCF[mm$arm == 1])),
+    setNames(lapply(fits, function(f) tryCatch(model_mcf(f, base_cov), error = function(e) c(NA, NA))),
+             paste0("MCF-", names(fits)))                                  # "MCF-LWYY ..." / "MCF-GL ..."
+  )
+}
+
+
+#----------- Section 4: Bootstrap -------------------------------------
+
+# Draw bootstrap sample
+boot_sample <- function(dat){
+  draw <- dat %>%
+    distinct(ID, arm) %>%  # one line per patient
+    group_by(arm) %>%          # seperate for each arm
+    slice_sample(prop = 1, replace = TRUE) %>%  # draw with replacemant same number of patient per arm
+    ungroup() %>%
+    mutate(ID_new = row_number()) %>%           # new ID, if one unit is sampled twice
+    dplyr::select(ID, ID_new)
+  
+  draw <- draw %>%
+    inner_join(dat, by ="ID", relationship = "many-to-many") %>%  # join all weeks
+    mutate(ID=ID_new) %>%
+    dplyr::select(-ID_new) %>%
+    arrange(ID,t)
+}
+
+# Estimate weights and models
+boot_estimate <- function(Odat_all){
+  Odat_w  <- compute_weights(Odat_all %>% filter(observed)) 
+  fits    <- fit_models(Odat_all, Odat_w)                      
+  mcf_est <- mcf_estimate(Odat_all, Odat_w, fits)             
+  c(sapply(fits,    function(f)  unname(coef(f)["arm"])),      
+    sapply(mcf_est, function(mu) log(mu[2] / mu[1])))
+  
+}
+
+
+# Run bootstrap
+
+run_bootstrap <- function(Odat_all, n_boot){
+  est <- lapply(seq_len(n_boot), function(b)
+    tryCatch(boot_estimate(boot_sample(Odat_all)), error = function(e) NULL))
+  est <- est[!vapply(est, is.null, logical(1))]                                   # save in matrix
+  if (length(est) == 0) stop("all Bootstrap-samples failed")
+  est <- do.call(rbind, est) 
+  
+  tibble(
+    Model        = colnames(est),
+    Boot_SE      = apply(est, 2, sd, na.rm = TRUE),                               # Bootstrap SE
+    Boot_CI_low  = apply(est, 2, quantile, probs = 0.025, na.rm = TRUE),          # Confidence interval
+    Boot_CI_high = apply(est, 2, quantile, probs = 0.975, na.rm = TRUE),
+    n_boot_ok    = colSums(!is.na(est))                                           # boot ok
+  )
 }
 
 

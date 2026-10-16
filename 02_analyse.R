@@ -97,12 +97,11 @@ print(summary_stat_full)
 #----------- Section 3: Estimation of Weights -----------#
 ##########################################################
 # Stabilised weights with ipwtm, estimated separately per arm.
-#   numerator  : baseline covariates + time (the same covariates are in the outcome model)
-#   denominator: numerator + proxies (sym, sym_train) or true frailty (oracle)
-# two corrections around ipwtm:
-#   1) ipwtm is fitted on weeks WITHOUT death (dropout only possible if the person survives the week)
-#   2) lag_ipw(): the weight for week t is the ipwtm weight of week t-1, because the falls of
-#      week t are observed before a dropout at the end of week t
+# - numerator  : baseline covariates + time (the same covariates are in the outcome model)
+# - denominator: numerator + proxies (sym, sym_train) or true frailty (oracle)
+# - ipwtm is fitted on weeks without death (dropout only possible if the person survives the week)
+# - lag_ipw(): the weight for week t is the ipwtm weight of week t-1, because the falls of
+#   week t are observed before a dropout at the end of week t
 # Unstabilised weights (ipwtm without numerator) are needed for the mean number of falls (Section 5).
 
 Odat_w <- compute_weights(Odat)

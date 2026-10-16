@@ -1,6 +1,6 @@
-############################################################################################
+
 #------- Data generation ---------------------------------------------------------------##
-###########################################################################################
+
 # Load packages
 library(simcausal)
 library(tidyverse)
@@ -12,10 +12,10 @@ library(mets)       # true values: Ghosh-Lin
 
 
 source("functions.R")
+source("GlobalVars.R")
 
-###########################################################################################
+
 #-------Fixed coefficents----------------------------------------------------------------##
-###########################################################################################
 
 COEF <- list(
   age_cent = 72.5,     # centered age (mid age)
@@ -47,7 +47,7 @@ sim_dag <- function(n, seed, arm_value = NA,
                     train_frailty_eff = 0.02,        # frailty reduction per training session
                     max_frailty_red = 0.5,           # maximal frailty reduction
                     eff_frailty_y = 0.4,             # effect frailty on falls
-                    eff_frailty_cens = 0.6,          # effect frailty on death
+                    eff_frailty_death = 0.6,          # effect frailty on death
                     eff_frailty_drop = 0.6,          # effect frailty on dropout (informative)
                     eff_frailty_train = -0.8,        # effect frailty on training (<0: frail train less)
                     eff_L1_drop = 0.0                # observed baseline falls -> dropout (positive control)
@@ -87,7 +87,7 @@ sim_dag <- function(n, seed, arm_value = NA,
     node("Yfull",    t = 0, distr = "rconst", const = 0) +               # number of falls
     node("Death",    t = 0, distr = "rconst", const = 0) +               
     node("Dropout",  t = 0, distr = "rconst", const = 0) +
-    node("Yobs",     t = 0, distr = "rconst", const = 0)                 # fall at time t(yes/no)
+    node("Yobs",     t = 0, distr = "rconst", const = 0)                 # fall at time t (yes/no)
   
   #--- t>0 --------------------------------------------------------------------------------------------
   D <- D +
@@ -116,7 +116,7 @@ sim_dag <- function(n, seed, arm_value = NA,
     node("Death", t = 1:t.end, distr = "rbern",
          prob = ifelse(Death[t-1] == 1, 1,
                        plogis(death_intercept + d_age * (age[0] - age_cent) + d_sex * (sex[0] - sex_cent) +
-                                eff_frailty_cens * FrailtyT[t]))) +
+                                eff_frailty_death * FrailtyT[t]))) +
     
     # dropout at the end of week t, not possible if died in this week (or before)
     node("Dropout", t = 1:t.end, distr = "rbern",
@@ -138,32 +138,32 @@ simulate_scenario <- function(
     seed = 123,
     n_pts = 1800,                    # number of patients (~900 per arm)
     t.end = 52,                      # maximal time (one year in weeks)
-    true_beta_arm = -0.4,            # TRUE treatment effect on recurrent falls
+    true_beta_arm = -0.4,            # true treatment effect on recurrent falls
     frailty_sd = 1.0,                # sd of Frailty
     drop_intercept = -5.3,           # Baseline dropout per week (calibrated per scenario with calib_logit)
     drop_beta_arm = 0.0,             # extra arm effect on dropout (<0: training group drops out less), with frailty effects dropout differs between arms also for 0
     train_intercept = 0.55,          # Baseline train rate (calibrated per scenario with calib_logit: 63 % train in week 1)
     Y_intercept = -3.5,              # Baseline fall rate per week (calibrated per scenario with calib_Y)
-    death_intercept = -Inf,          # calibrated per scenario with calib_logit (-Inf = no death)
+    death_intercept = -Inf,          # Intercept for mortality, calibrated per scenario with calib_logit (-Inf = no death)
     # Parameter for scenarios
     train_frailty_eff = 0.02,  # reduction of frailty per training session (0 = no effect)
     max_frailty_red   = 0.5,   # maximal reduction of frailty (stabilizes afterwards)
     eff_frailty_y = 0.4,       # Effect frailty on falls
-    eff_frailty_cens = 0.6,    # Effect frailty on death
+    eff_frailty_death = 0.6,    # Effect frailty on death
     eff_frailty_drop = 0.6,    # Effect frailty on dropout (informative censoring)
     eff_frailty_train = -0.8,  # Effect frailty on training (<0 : train less >0: train more)
     eff_L1_drop = 0.0          # Effect observed baseline falls on dropout (positive control, should be corrected by ipcw)
     
 ) {
   
-  #DAG is defined once in sim_dag()
+  #DAG is defined in sim_dag()
   Odat <- sim_dag(n = n_pts, seed = seed, t.end = t.end,
                   true_beta_arm = true_beta_arm, frailty_sd = frailty_sd,
                   Y_intercept = Y_intercept, drop_intercept = drop_intercept,
                   death_intercept = death_intercept, drop_beta_arm = drop_beta_arm,
                   train_intercept = train_intercept,
                   train_frailty_eff = train_frailty_eff, max_frailty_red = max_frailty_red,
-                  eff_frailty_y = eff_frailty_y, eff_frailty_cens = eff_frailty_cens,
+                  eff_frailty_y = eff_frailty_y, eff_frailty_death = eff_frailty_death,
                   eff_frailty_drop = eff_frailty_drop, eff_frailty_train = eff_frailty_train,
                   eff_L1_drop = eff_L1_drop)
   
@@ -173,7 +173,7 @@ simulate_scenario <- function(
   }
   
   Odat %<>%
-    arrange(ID, t) %>%
+    arrange(ID, t) %>%  # arrange for ID and t
     group_by(ID) %>%
     mutate(
       arm = A1[1],
@@ -200,19 +200,19 @@ simulate_scenario <- function(
     filter(t >= 1, is.na(death_time) | t <= death_time) %>%
     mutate(
       # TRUE = alive and in study at the start of week t
-      #           (dropout at the END of week dropout_time -> that week is still observed)
+      # (dropout at the END of week dropout_time -> that week is still observed)
       observed = is.na(dropout_time) | t <= dropout_time,
       
       # number of falls (several falls per week possible)
       n_falls      = ifelse(observed, Yobs, NA),   # observed falls
       n_falls_full = Yfull,                        # complete data (oracle M0)
       
-      # separate indicators: an event at the end of the week AND falls in that week are possible
+      # separate indicators: death at the end of the week and falls in that week are possible
       drop       = as.integer(observed & !is.na(dropout_time) & t == dropout_time),
       death      = as.integer(observed & !is.na(death_time) & t == death_time),
       death_full = as.integer(!is.na(death_time) & t == death_time),
       
-      train_rate_lag = ifelse(t > 1, cum_train_lag / (t - 1), 0),   # share of weeks trained
+      train_rate_lag = ifelse(t > 1, cum_train_lag / (t - 1), 0),   # share of weeks trained (until t-1)
       
       # observed data: 0 = no event, 1 = fall, 2 = Dropout, 3 = death, NA = not observed
       # NOTE: only for quick checks - in a death/dropout week the falls are hidden here;
@@ -240,11 +240,12 @@ simulate_scenario <- function(
 
 
 
-##########################################################################################
+
 #-------Simulate true values ------------------------------------------------------------##
 ###### Monte Carlo Simulation of the true values ##########################################
-###########################################################################################
-# simulate a very large trial per scenario without dropout (complete data; only death stops falls). Then
+
+
+# simulate a very large trial per scenario without dropout (complete data, only death stops falls). Then
 #   - mean number of falls per arm  -> True_LogRateRatio
 #   - fit the same models as in the analysis (LWYY, Ghosh-Lin, adjusted for age, sex,
 #     log_base_falls on these complete data -> True_Beta_LWYY, True_Beta_GL
@@ -256,29 +257,23 @@ simulate_true <- function(n_pts_true = 50000,
                           ...) {                 # all other DGP parameters -> sim_dag()
   bind_rows(
     sim_dag(n = n_pts_true, seed = seed, arm_value = 0, ...),                              # control
-    sim_dag(n = n_pts_true, seed = seed, arm_value = 1, ...) %>% mutate(ID = ID + n_pts_true)  # training
+    sim_dag(n = n_pts_true, seed = seed, arm_value = 1, ...) %>%                           # training
+      mutate(ID = ID + n_pts_true)  
   )
 }
 
 
-############################################################################################
 #------------------- Scenarios -----------------------------------------------------------##
-############################################################################################
-
-n_sim <- 1                    # Number of simulations per scenario (Set to 500 or 1000 later)
-
-#-------------------------------------------------------------------------------------------
 # Calibration of intercepts
-# The intercepts are chosen so that the rates in the whole population (with frailty)
-# hit the targets, not only for an average person.
+# The intercepts are chosen so that the rates in the whole population (with frailty) hit the targets
 # coefficients from COEF -> automatically the same as in sim_dag()
-#-------------------------------------------------------------------------------------------
+
 # reference population with the same distribution as in the data generation (frailty_sd = 1)
 set.seed(1)
 cd <- tibble(age = runif(2e5, 65, 80), sex = rbinom(2e5, 1, 0.5), Z = rnorm(2e5),  # Z=frailty
              U = runif(2e5))                                                       # uniform for L1 (scenario 4)
 
-# Y_intercept so that number of units with >= 1 fall in 52 weeks = target (control arm, no death)
+# Y_intercept so that number of units with >= 1 fall in 52 weeks = target (for control arm, no death)
 # P(N >= 1) = 1 - exp(-52 * weekly rate) (Poisson), averaged over all persons
 calib_Y <- function(eff_frailty_y, target = 0.30, t.end = 52) {
   lp <- COEF$y_age * (cd$age - COEF$age_cent) + COEF$y_sex * (cd$sex - COEF$sex_cent) + eff_frailty_y * cd$Z
@@ -293,10 +288,6 @@ calib_logit <- function(lp, target, t.end = 52) {
   uniroot(function(b) mean(1 - (1 - plogis(b + lp))^t.end) - target, c(-20, 5))$root
 }
 
-target_falls   <- 0.30                                          # percentage of units with at least one fall per year (control arm)
-target_dropout <- 0.20                                          # perc with dropout per year (control arm)
-target_death   <- c(none = 0, low = 0.002, high = 0.02)         # mortality per year (none = no death)
-target_train   <- 0.63                                          # share of persons training in week 1 (training arm)
 # training: calibrated only for week 1, because later weeks depend on the own training history
 # (training -> frailty -> training). In week 1 CumTrain = 0 -> FrailtyT = Frailty, so
 # calib_logit with t.end = 1 gives E[plogis(b + lp)] = target
@@ -306,12 +297,14 @@ target_train   <- 0.63                                          # share of perso
 #  - 2_Informative: frailty -> falls, death, dropout, training; training -> frailty
 #  - 3_NoInfDropout: as 2, but dropout does not depend on frailty
 #  - 4_ObsDropout: as 2, but dropout depends on the observed proxy L1 (positive control)
+#  - 5_NoIndirect: as 2, but training does not reduce frailty (no indirect effect via frailty
 scenarios_def <- tribble(
-  ~scenario_name,    ~eff_frailty_y, ~eff_frailty_cens, ~eff_frailty_drop, ~eff_L1_drop, ~eff_frailty_train, ~train_frailty_eff,
+  ~scenario_name,    ~eff_frailty_y, ~eff_frailty_death, ~eff_frailty_drop, ~eff_L1_drop, ~eff_frailty_train, ~train_frailty_eff,
   "1_NoFrailty",     0.0,            0.0,               0.0,               0.0,          0.0,                0.0,
   "2_Informative",   1.2,            1.2,               0.8,               0.0,         -1.5,                0.02,
   "3_NoInfDropout",  1.2,            1.2,               0.0,               0.0,         -1.5,                0.02,
-  "4_ObsDropout",    1.2,            1.2,               0.0,               1.0,         -1.5,                0.02
+  "4_ObsDropout",    1.2,            1.2,               0.0,               1.0,         -1.5,                0.02,
+  "5_NoIndirect",    1.2,            1.2,               0.8,               0.0,         -1.5,                0.0
 )
 
 
@@ -323,7 +316,7 @@ base_scenarios <- expand_grid(
   mortality_level = c("none", "low", "high")    # "none" = no death, negligible and non-negligible mortality
 ) %>%
   cross_join(scenarios_def) %>%
-  # control scenarios 3 and 4 not fully crossed: only H1, no and high mortality (2 x 2 = 4 instead of 12 each)
+  # control scenarios 3,4,5 not fully crossed: only H1, no and high mortality (2 x 2 = 4 instead of 12 each)
   filter(scenario_name %in% c("1_NoFrailty", "2_Informative") |
            (true_beta_arm == -0.4 & mortality_level %in% c("none", "high"))) %>%
   mutate(train_frailty_eff = ifelse(true_beta_arm == 0, 0, train_frailty_eff)) %>%   # strict H0: no effect via training either
@@ -337,149 +330,201 @@ base_scenarios <- expand_grid(
                                                                                eff_frailty_y * cd$Z))),
                                   target_dropout),
     death_intercept = calib_logit(COEF$d_age * (cd$age - COEF$age_cent) + COEF$d_sex * (cd$sex - COEF$sex_cent) +
-                                    eff_frailty_cens * cd$Z, target_death[[mortality_level]]),
+                                    eff_frailty_death * cd$Z, target_death[[mortality_level]]),
     train_intercept = calib_logit(COEF$train_age * (cd$age - COEF$age_cent) + COEF$train_sex * (cd$sex - COEF$sex_cent) +
                                     eff_frailty_train * cd$Z, target_train, t.end = 1)
   ) %>%
   ungroup() %>%
   mutate(scenario_id = row_number())
 
-############################################################################################
+
 #------------------- True values ---------------------------------------------------------##
-############################################################################################
 
 
-# true values
 # The true values do not depend on the dropout mechanism (Yfull continues after dropout),
 # so they are computed once per causal scenario
+# Monte Carlo in blocks of n_chunk_true patients per arm 
+#   - one parallel task = one causal scenario x one block -> memory per worker depends only on n_chunk_true
+#   - per block only small summaries are kept (falls per arm and quarter, deaths, model coefficients)
+#   - mean numbers of falls: pooled over all blocks; LWYY / GL: mean of the block estimates
+#     (bias of a block estimate is O(1 / n_chunk_true), negligible)
+#   - Monte Carlo SE of each true value = sd over the blocks / sqrt(n_blocks)
+#   - seed depends only on scenario and block -> a larger n_true keeps the first blocks and adds new ones
+
+
 
 unique_causal_scenarios <- base_scenarios %>%
-  distinct(scenario_name, true_beta_arm, mortality_level, .keep_all = TRUE)
+  distinct(across(all_of(causal_vars)), .keep_all = TRUE) %>%
+  dplyr::select(all_of(causal_vars), Y_intercept, death_intercept, train_intercept) %>%   # intercepts follow from causal_vars
+  mutate(causal_id = row_number())
+
+if (n_true %% n_chunk_true != 0) stop("n_true must be a multiple of n_chunk_true")
+n_blocks <- n_true / n_chunk_true
+
+true_tasks <- expand_grid(causal_id = unique_causal_scenarios$causal_id,
+                          block     = seq_len(n_blocks))
+
+# one block of the true value simulation for scenario p
+# both arms with the same seed, once with and once without death
+true_block <- function(p, block, n_chunk, seed) {
+  
+  # only the death intercept differs between the calls, only the columns needed later are kept
+  sim_both <- function(death_intercept) {
+    simulate_true(
+      n_pts_true        = n_chunk,
+      seed              = seed,                   # same seed in both arms
+      true_beta_arm     = p$true_beta_arm,
+      Y_intercept       = p$Y_intercept,          # calibrated
+      drop_intercept    = -Inf,                   # no dropout in truth
+      death_intercept   = death_intercept,        # -Inf = no death
+      eff_frailty_y     = p$eff_frailty_y,
+      eff_frailty_death  = p$eff_frailty_death,
+      eff_frailty_train = p$eff_frailty_train,
+      train_intercept   = p$train_intercept,      # calibrated
+      train_frailty_eff = p$train_frailty_eff
+    ) %>%
+      mutate(arm = as.integer(ID > n_chunk)) %>%  # arm from ID (A1 is only stored at t = 0)
+      dplyr::select(ID, t, arm, age, sex, L1, Yfull, Death)
+  }
+  
+  # with death (scenario)
+  dat <- sim_both(p$death_intercept)
+  falls <- dat %>%                                # falls per arm and quarter
+    filter(t >= 1) %>%
+    mutate(q = cut(t, c(0, 13, 26, 39, 52), labels = paste0("Q", 1:4))) %>%
+    group_by(arm, q) %>%
+    summarise(y = sum(Yfull), .groups = "drop") %>%
+    tidyr::complete(arm, q, fill = list(y = 0))   # quarter without falls -> 0 (keeps Q1..Q4)
+  deaths <- dat %>%                               # deaths per arm (death is absorbing)
+    filter(t == max(t)) %>%
+    group_by(arm) %>%
+    summarise(d = sum(Death), .groups = "drop")
+  ag <- prep_data_true(dat)
+  rm(dat)
+  
+  # same models as in the analysis, fitted on the complete data of this block
+  fit_lwyy <- coxph(Surv(start, stop, status == 1) ~ arm + age + sex + log_base_falls,
+                    data = ag, ties = "breslow")
+  fit_gl   <- recreg(Event(start, stop, status) ~ arm + age + sex + log_base_falls + cluster(ID),
+                     data = ag, cause = 1, death.code = 3, cens.code = 0)
+  rm(ag)
+  
+  # without death (hypothetical)
+  dat_nd   <- sim_both(-Inf)
+  falls_nd <- dat_nd %>%
+    filter(t >= 1) %>%
+    group_by(arm) %>%
+    summarise(y = sum(Yfull), .groups = "drop")
+  rm(dat_nd); gc()
+  
+  y_q <- function(a) falls %>% filter(arm == a) %>% arrange(q) %>% pull(y)   # falls per quarter, Q1..Q4
+  
+  tibble(causal_id = p$causal_id,
+         block     = block,
+         y_ctrl    = sum(y_q(0)),
+         y_int     = sum(y_q(1)),
+         y_ctrl_nd = sum(falls_nd$y[falls_nd$arm == 0]),
+         y_int_nd  = sum(falls_nd$y[falls_nd$arm == 1]),
+         d_ctrl    = sum(deaths$d[deaths$arm == 0]),
+         d_int     = sum(deaths$d[deaths$arm == 1]),
+         !!!setNames(as.list(y_q(0)), paste0("y_ctrl_Q", 1:4)),
+         !!!setNames(as.list(y_q(1)), paste0("y_int_Q", 1:4)),
+         beta_lwyy = unname(coef(fit_lwyy)["arm"]),
+         beta_gl   = unname(coef(fit_gl)["arm"]))
+}
 
 cat("Set up a parallel backend for true values\n")
 no_cores <- parallel::detectCores() - 1
-cl <- makeCluster(min(no_cores, 4))   # few workers: each needs ~0.5-1 GB RAM (see n_chunk)
+cl <- makeCluster(min(no_cores, n_cores_true))   # each worker needs memory for one block (see n_chunk_true)
 registerDoParallel(cl)
 
-true_estimands_df <- foreach(i = 1:nrow(unique_causal_scenarios),
-                             .combine = bind_rows,
-                             .packages = c("simcausal", "dplyr", "tidyr", "survival", "mets"),
-                             .export = c("COEF", "sim_dag", "simulate_true", "prep_data_true")) %dopar% {
-                               
-                               p <- unique_causal_scenarios[i, ]
-                               
-                               n_true  <- 50000                    # patients per arm
-                               n_chunk <- 10000                    # patients per arm and block (less = less memory), to not get storage problems
-                                                                   # n_true must be a multiple of n_chunk
-
-                               # helper function: simulate both arms of one block with all scenario parameters,
-                               # only the death intercept differs between the calls
-                               # only the columns needed later are kept (to save storage)
-                               sim_both <- function(death_intercept, seed) {
-                                 simulate_true(
-                                   n_pts_true        = n_chunk,
-                                   seed              = seed,                   # same seed in both arms
-                                   true_beta_arm     = p$true_beta_arm,
-                                   Y_intercept       = p$Y_intercept,          # calibrated
-                                   drop_intercept    = p$drop_intercept,       # irrelevant for the truth (no influence on Yfull)
-                                   death_intercept   = death_intercept,        # -Inf = no death
-                                   eff_frailty_y     = p$eff_frailty_y,
-                                   eff_frailty_cens  = p$eff_frailty_cens,
-                                   eff_frailty_train = p$eff_frailty_train,
-                                   train_intercept   = p$train_intercept,      # calibrated
-                                   train_frailty_eff = p$train_frailty_eff
-                                 ) %>%
-                                   mutate(arm = as.integer(ID > n_chunk)) %>%  # arm from ID (A1 is only stored at t = 0)
-                                   dplyr::select(ID, t, arm, age, sex, L1, Yfull, Death)
-                               }
-
-                               # simulate in blocks: the weekly data of a block are discarded directly,
-                               # only small summaries and the interval data (ag) are kept
-                               res <- lapply(seq_len(n_true / n_chunk), function(k) {
-                                 seed_k <- 888000 + 100 * i + k           # unique seed for each scenario and block
-
-                                 dat <- sim_both(p$death_intercept, seed_k)   # with death (scenario)
-                                 out <- list(
-                                   falls  = dat %>%                         # falls per arm and quarter
-                                     filter(t >= 1) %>%
-                                     mutate(q = cut(t, c(0, 13, 26, 39, 52))) %>% # time per quarter of year, for time varying effect
-                                     group_by(arm, q) %>%
-                                     summarise(y = sum(Yfull), .groups = "drop"),
-                                   deaths = dat %>%                         # deaths per arm
-                                     filter(t == max(t)) %>%
-                                     group_by(arm) %>%
-                                     summarise(d = sum(Death), .groups = "drop"),
-                                   ag     = prep_data_true(dat) %>%
-                                     mutate(ID = ID + 2 * n_chunk * (k - 1))   # unique IDs over all blocks
-                                 )
-                                 rm(dat)
-
-                                 dat_nd <- sim_both(-Inf, seed_k)         # without death (hypothetical)
-                                 out$falls_nd <- dat_nd %>%
-                                   filter(t >= 1) %>%
-                                   group_by(arm) %>%
-                                   summarise(y = sum(Yfull), .groups = "drop")
-                                 rm(dat_nd); gc()
-                                 out
-                               })
-
-                               falls    <- bind_rows(lapply(res, `[[`, "falls"))
-                               falls_nd <- bind_rows(lapply(res, `[[`, "falls_nd"))
-                               deaths   <- bind_rows(lapply(res, `[[`, "deaths"))
-                               ag       <- bind_rows(lapply(res, `[[`, "ag"))
-                               rm(res)
-
-                               # mean number of falls until t.end per arm
-                               mcf_ctrl    <- sum(falls$y[falls$arm == 0]) / n_true
-                               mcf_int     <- sum(falls$y[falls$arm == 1]) / n_true
-                               mcf_ctrl_nd <- sum(falls_nd$y[falls_nd$arm == 0]) / n_true
-                               mcf_int_nd  <- sum(falls_nd$y[falls_nd$arm == 1]) / n_true
-                               rate_ratio  <- mcf_int / mcf_ctrl
-
-                               # time-varying effect: log ratio of mean falls per quarter
-                               rr_q <- falls %>%
-                                 group_by(q) %>%
-                                 summarise(lrr = log(sum(y[arm == 1]) / sum(y[arm == 0])), .groups = "drop") %>%
-                                 pull(lrr)
-
-                               # same models as in the analysis, fitted on the complete data (all blocks)
-                               fit_lwyy <- coxph(Surv(start, stop, status == 1) ~ arm + age + sex + log_base_falls,
-                                                 data = ag, ties = "breslow")
-                               fit_gl <- recreg(Event(start, stop, status) ~ arm + age + sex + log_base_falls + cluster(ID),
-                                                data = ag, cause = 1, death.code = 3, cens.code = 0)
-                               
-                               # results
-                               data.frame(
-                                 Scenario_Name = p$scenario_name,
-                                 Mortality = p$mortality_level,
-                                 True_Beta_Arm = p$true_beta_arm,
-                                 MCF_Control = mcf_ctrl,
-                                 MCF_Intervention = mcf_int,
-                                 MCF_Control_NoDeath = mcf_ctrl_nd,
-                                 MCF_Intervention_NoDeath = mcf_int_nd,
-                                 True_RateRatio = rate_ratio,
-                                 True_LogRateRatio = log(rate_ratio),                        # ratio of mean falls (nonparametric GL)
-                                 True_LogRateRatio_NoDeath = log(mcf_int_nd / mcf_ctrl_nd),  # hypothetical, no death
-                                 True_Beta_LWYY = unname(coef(fit_lwyy)["arm"]),             # target of the adjusted LWYY
-                                 True_Beta_GL   = unname(coef(fit_gl)["arm"]),               # target of the adjusted Ghosh-Lin
-                                 Mort_Control = sum(deaths$d[deaths$arm == 0]) / n_true,       # achieved mortality per arm
-                                 Mort_Intervention = sum(deaths$d[deaths$arm == 1]) / n_true,
-                                 LogRR_Q1 = rr_q[1], LogRR_Q2 = rr_q[2], LogRR_Q3 = rr_q[3], LogRR_Q4 = rr_q[4]
-                               )
-                             }
+true_blocks <- foreach(j = seq_len(nrow(true_tasks)),
+                       .combine = bind_rows,
+                       .packages = c("simcausal", "dplyr", "tidyr", "survival", "mets"),
+                       .export = c("COEF", "sim_dag", "simulate_true", "prep_data_true", "true_block",
+                                   "unique_causal_scenarios", "true_tasks", "n_chunk_true")) %dopar% {
+                                     i <- true_tasks$causal_id[j]
+                                     k <- true_tasks$block[j]
+                                     # unique per scenario and block, separate from the data seeds (1e6 * scenario_id + run)
+                                     true_block(unique_causal_scenarios[i, ], k, n_chunk_true, seed = 1e9 + 1e5 * i + k)
+                                   }
 
 stopCluster(cl)
 
-# save true values
-if(!dir.exists("./results")) dir.create("./results")
+if (!dir.exists("./results")) dir.create("./results")
+saveRDS(true_blocks, "./results/00_true_blocks.rds")    # block results: check MC error, add blocks later
+
+# Monte Carlo SE over the blocks
+mcse <- function(x) if (length(x) > 1) sd(x) / sqrt(length(x)) else NA_real_
+
+true_estimands_df <- true_blocks %>%
+  group_by(causal_id) %>%
+  summarise(
+    N_True = n() * n_chunk_true,                                   # patients per arm
+    # Monte Carlo SE from the variation between the blocks (before the counts are summed up)
+    MCSE_LogRateRatio         = mcse(log(y_int / y_ctrl)),
+    MCSE_LogRateRatio_NoDeath = mcse(log(y_int_nd / y_ctrl_nd)),
+    MCSE_Beta_LWYY            = mcse(beta_lwyy),
+    MCSE_Beta_GL              = mcse(beta_gl),
+    MCSE_LogRR_Q1             = mcse(log(y_int_Q1 / y_ctrl_Q1)),
+    MCSE_LogRR_Q2             = mcse(log(y_int_Q2 / y_ctrl_Q2)),
+    MCSE_LogRR_Q3             = mcse(log(y_int_Q3 / y_ctrl_Q3)),
+    MCSE_LogRR_Q4             = mcse(log(y_int_Q4 / y_ctrl_Q4)),
+    True_Beta_LWYY            = mean(beta_lwyy),                   # target of the adjusted LWYY
+    True_Beta_GL              = mean(beta_gl),                     # target of the adjusted Ghosh-Lin
+    across(c(starts_with("y_"), starts_with("d_")), sum),          # pooled counts over all blocks
+    .groups = "drop"
+  ) %>%
+  mutate(
+    MCF_Control               = y_ctrl    / N_True,                # mean number of falls until t.end per arm
+    MCF_Intervention          = y_int     / N_True,
+    MCF_Control_NoDeath       = y_ctrl_nd / N_True,
+    MCF_Intervention_NoDeath  = y_int_nd  / N_True,
+    True_LogRateRatio         = log(MCF_Intervention / MCF_Control),                 # ratio of mean falls (nonparametric GL)
+    True_LogRateRatio_NoDeath = log(MCF_Intervention_NoDeath / MCF_Control_NoDeath), # hypothetical, no death
+    LogRR_Q1                  = log(y_int_Q1 / y_ctrl_Q1),         # time-varying effect per quarter
+    LogRR_Q2                  = log(y_int_Q2 / y_ctrl_Q2),
+    LogRR_Q3                  = log(y_int_Q3 / y_ctrl_Q3),
+    LogRR_Q4                  = log(y_int_Q4 / y_ctrl_Q4),
+    Mort_Control              = d_ctrl / N_True,                   # achieved mortality per arm
+    Mort_Intervention         = d_int  / N_True
+  ) %>%
+  left_join(unique_causal_scenarios %>% dplyr::select(causal_id, all_of(causal_vars)),
+            by = "causal_id") %>%
+  # same truth for all scenarios with the same causal parameters (e.g. 2, 3, 4 only differ in dropout)
+  inner_join(base_scenarios %>%
+               distinct(across(all_of(causal_vars)), scenario_name),
+             by = causal_vars, relationship = "one-to-many") %>%
+  mutate(Scenario_Name = scenario_name, Mortality = mortality_level, True_Beta_Arm = true_beta_arm) %>%
+  
+  # strict H0 (no direct effect and no effect via training): both arms have the same distribution
+  # -> all effects are exactly 0, levels per arm are the same (mean of both arms = less MC error)
+  # the MCSE columns still show the Monte Carlo noise of the simulated values
+  mutate(
+    h0 = True_Beta_Arm == 0 & train_frailty_eff == 0,
+    across(c(True_LogRateRatio, True_LogRateRatio_NoDeath, True_Beta_LWYY, True_Beta_GL, starts_with("LogRR_Q")),
+           ~ ifelse(h0, 0, .x)),
+    MCF_Control              = ifelse(h0, (MCF_Control + MCF_Intervention) / 2, MCF_Control),
+    MCF_Intervention         = ifelse(h0, MCF_Control, MCF_Intervention),
+    MCF_Control_NoDeath      = ifelse(h0, (MCF_Control_NoDeath + MCF_Intervention_NoDeath) / 2, MCF_Control_NoDeath),
+    MCF_Intervention_NoDeath = ifelse(h0, MCF_Control_NoDeath, MCF_Intervention_NoDeath),
+    True_RateRatio           = exp(True_LogRateRatio)
+  ) %>%
+  dplyr::select(Scenario_Name, Mortality, True_Beta_Arm,
+                MCF_Control, MCF_Intervention, MCF_Control_NoDeath, MCF_Intervention_NoDeath,
+                True_RateRatio, True_LogRateRatio, True_LogRateRatio_NoDeath,
+                True_Beta_LWYY, True_Beta_GL, Mort_Control, Mort_Intervention,
+                LogRR_Q1, LogRR_Q2, LogRR_Q3, LogRR_Q4,
+                N_True, starts_with("MCSE_"))
+
 write_csv(true_estimands_df, "./results/00_true_estimands.csv")
 
 cat("True values are simulated and saved.\n")
 
 
-############################################################################################
+
+
 #------------------- Simulate all scenarios ----------------------------------------------##
-############################################################################################
 
 
 
@@ -488,7 +533,7 @@ scenarios <- expand_grid(
   base_scenarios,
   sim_run = 1:n_sim
 ) %>%
-  mutate(seed = 123000 + row_number())
+  mutate(seed = 1e6*scenario_id + sim_run)
 
 if(!dir.exists("./results")) {
   dir.create("./results")
@@ -522,7 +567,7 @@ results_log <- foreach(i = 1:nrow(scenarios),
                            drop_intercept = p$drop_intercept,
                            death_intercept = p$death_intercept,
                            eff_frailty_y = p$eff_frailty_y,
-                           eff_frailty_cens = p$eff_frailty_cens,
+                           eff_frailty_death = p$eff_frailty_death,
                            eff_frailty_drop = p$eff_frailty_drop,
                            eff_L1_drop = p$eff_L1_drop,                
                            eff_frailty_train = p$eff_frailty_train,
@@ -547,11 +592,10 @@ write_csv(results_log, "./results/00_simulation_log.csv")
 cat("All data records were successfully generated in parallel\n")
 
 
-###########################################################################################
 #------- Checks (run once before the large run) ------------------------------------------##
-###########################################################################################
+
 # 1) true values: 1_NoFrailty with -0.4 -> True_LogRateRatio, True_Beta_LWYY, True_Beta_GL ~ -0.4;
-#    H0 -> ~0; mortality "none": True_LogRateRatio = True_LogRateRatio_NoDeath, True_Beta_LWYY ~ True_Beta_GL
+#    H0= 0,check the simulated values in 00_true_blocks.rds; mortality "none": True_LogRateRatio = True_LogRateRatio_NoDeath, True_Beta_LWYY ~ True_Beta_GL
 true_estimands_df %>%
   select(Scenario_Name, Mortality, True_Beta_Arm, True_LogRateRatio, True_LogRateRatio_NoDeath,
          True_Beta_LWYY, True_Beta_GL, starts_with("LogRR_Q")) %>%
@@ -569,6 +613,6 @@ Odat %>%
   group_by(arm, frail_q) %>%
   summarise(p_fall = mean(any_fall), p_drop = mean(dropped), p_death = mean(died), .groups = "drop")
 
-# 3) [NEW] counting-process rows keep all observed falls
+# 3) counting-process rows keep all observed falls
 cp <- prep_counting(Odat, "observed")
 stopifnot(sum(cp$status == 1) == sum(Odat$n_falls, na.rm = TRUE))
