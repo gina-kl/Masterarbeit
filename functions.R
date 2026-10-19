@@ -8,9 +8,18 @@
 
 #------------- Section 1: Data preparation -----------------------------------
 
+# Ties: falls of different persons at exavtly the same time
+# Different handled by coxph and mets 
+# Every fall time of a person is moved by the same small person-specific offset (0, eps) to the left
+# - deterministic, not related to the arm (golden ratio hash of ID)
+# - same offset for all falls of a person -> order within a person stays the same
+# - risk set is constant within a week (death/censoring only at t + 0.001) -> Breslow estimate unchanged
+tie_offset <- function(ID, eps = 0.01) eps * ((ID * 0.6180339887498949) %% 1)
+
+
 # Prepare counting-process data for true model
 # complete data -> one row per interval between falls 
-# k falls in week t are placed at t-1 + j/(k+d), j = 1..k (d = 1 if death at the end of week t)
+# k falls in week t are placed at t-1 + j/(k+d), j = 1..k (d = 1 if death at the end of week t) minus tie_offset(ID) (no ties between persons)
 prep_data_true <- function(dat, t.end = 52) {
   base <- dat %>%
     filter(t == 0) %>%
@@ -27,7 +36,7 @@ prep_data_true <- function(dat, t.end = 52) {
     filter(Yfull > 0) %>%
     mutate(d = as.integer(t == death_time)) %>%
     tidyr::uncount(Yfull, .id = "j", .remove = FALSE) %>%
-    transmute(ID, stop = t - 1 + j / (Yfull + d), status = 1L)
+    transmute(ID, stop = t - 1 + j / (Yfull + d) - tie_offset(ID), status = 1L)   # no ties between persons
   
   ends <- wk %>%
     group_by(ID) %>%
@@ -82,8 +91,12 @@ prep_counting <- function(dat, data = c("observed", "full")) {
     mutate(start = stop, status = 0L)
   
   bind_rows(cp, extra) %>%
-    mutate(stop = ifelse(status %in% c(0L, 3L), stop + 0.001, stop)) %>%   # ties: falls first
+    mutate(stop = ifelse(status %in% c(0L, 3L), stop + 0.001, stop),        # ties: falls first
+           stop = ifelse(status == 1L, stop - tie_offset(ID), stop)) %>%    # no ties between persons
     arrange(ID, start, stop) %>%
+    group_by(ID) %>%
+       mutate(start = lag(stop, default = 0)) %>%                              # next row starts at the moved fall
+       ungroup() %>%
     dplyr::select(-k, -m, -j, -term_death, -term_drop, -last_row) %>%
     as.data.frame()
 }
@@ -136,14 +149,14 @@ fit_models <- function(Odat_all, Odat_w){
       "LWYY 3: IPCW sym"              = coxph(f_lwyy, data = cp, ties = "breslow", weights = cp$w_sym),
       "LWYY 4: IPCW sym_train"        = coxph(f_lwyy, data = cp, ties = "breslow", weights = cp$w_symtrain),
       "LWYY 5: IPCW oracle"           = coxph(f_lwyy, data = cp, ties = "breslow", weights = cp$w_oracle),
-      "GL 0: Full data (oracle M0)"   = recreg(f_gl, data = cp_full, cause = 1, death.code = 3, cens.code = 0, cens.model = ~ strata(arm)),
-      "GL 1: Naive (Unweighted)"      = recreg(f_gl, data = cp, cause = 1, death.code = 3, cens.code = 0, cens.model = ~ strata(arm)),
+      "GL 0: Full data (oracle M0)"   = recreg(f_gl, data = cp_full, cause = 1, death.code = 3, cens.code = 0, cens.model = ~ strata(arm), control = list(tol = 1e-12)),
+      "GL 1: Naive (Unweighted)"      = recreg(f_gl, data = cp, cause = 1, death.code = 3, cens.code = 0, cens.model = ~ strata(arm), control = list(tol = 1e-12)),
       "GL 3: IPCW sym"                = recreg(f_gl, data = cp, cause = 1, death.code = 3, cens.code = 0, cens.model = ~ strata(arm),
-                                               weights = cp$w_sym),
+                                               weights = cp$w_sym, control = list(tol = 1e-12)),
       "GL 4: IPCW sym_train"          = recreg(f_gl, data = cp, cause = 1, death.code = 3, cens.code = 0, cens.model = ~ strata(arm),
-                                               weights = cp$w_symtrain),
+                                               weights = cp$w_symtrain, control = list(tol = 1e-12)),
       "GL 5: IPCW oracle"             = recreg(f_gl, data = cp, cause = 1, death.code = 3, cens.code = 0, cens.model = ~ strata(arm),
-                                               weights = cp$w_oracle)
+                                               weights = cp$w_oracle, control = list(tol = 1e-12))  # stricter convergence (default tol 1e-6 stops too early)
     )
 }
 
@@ -264,7 +277,7 @@ weighted_mcf <- function(d, w = "w", falls = "n_falls", death = "death", t.end =
 }
 
 
-# Mean number of falls up to qurter of year per arm (nonparametric Ghosh-Lin / Cook-Lawless, weighted)
+# Mean number of falls up to quarter of year per arm (nonparametric Ghosh-Lin / Cook-Lawless, weighted)
 
 weighted_mcf_q <- function(d, w = "w", falls = "n_falls", death = "death", breaks =c(0,13,26,39,52)) {
   d %>%
@@ -296,7 +309,7 @@ weighted_mcf_q <- function(d, w = "w", falls = "n_falls", death = "death", break
 # basehaz with centered or not???
 model_mcf <- function(fit, base_cov, t.end = 52) {
   if (inherits(fit, "coxph")) {                              # LWYY
-    H0   <- basehaz(fit, centered = TRUE)                    # Lambda_0(t) at the centering values zbar = fit$means
+    H0   <- basehaz(fit, centered = TRUE)                    # Lambda_0(t) at the centering values zbar = fit$means, Breslow estimator
     H0_t <- max(H0$hazard[H0$time <= t.end])                 # (centered = FALSE can over-/underflow, see ?basehaz)
     b    <- coef(fit)
     zbar <- fit$means[names(b)]

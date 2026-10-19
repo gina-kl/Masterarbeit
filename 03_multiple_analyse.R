@@ -1,8 +1,7 @@
-###############################################################################
-### Mehrfach-Simulation: Analyse über alle Szenarien und Läufe             ###
-### Voraussetzung: n_sim in der Datengenerierung wurde erhöht (z.B. 1000)  ###
-### und alle Odat_scen*_run*.rds Dateien liegen in ./results/             ###
-###############################################################################
+
+#-- Multiple Simulation: Analyse over all sceanrios and all runs -----------------------
+#   Requires: n_sim in 01.generate weekly > 1 
+#   all Odat_scen*_run*.rds data in ./results/         
 
 library(ipw)
 library(tidyverse)
@@ -17,11 +16,9 @@ source("functions.R")   # expand_counting, prep_gl_data, extract_model_results,
 # lag_ipw, weighted_mcf, model_mcf
 source("GlobalVars.R")  # do_bootstrap, n_boot, boot_max_run, boot_scenarios, boot_seed_offset
 
-# -----------------------------------------------------------------------
-# all of analyse one function
-# -----------------------------------------------------------------------
+# -- all of analyse one function -------------------------------------------------------------------
 
-analyse_one_run <- function(file_path, sim_log, true_estimands, do_bootstrap = FALSE, n_boot = 200, boot_max_run = Inf,
+ analyse_one_run <- function(file_path, sim_log, true_estimands, do_bootstrap = FALSE, n_boot = 200, boot_max_run = Inf,
                             boot_scenarios = NULL, boot_seed_offset = 5e6) {
   
   Odat_all <- readRDS(file_path)
@@ -38,7 +35,7 @@ analyse_one_run <- function(file_path, sim_log, true_estimands, do_bootstrap = F
     return(tibble(file_path = file_path, error = "Kein eindeutiger Match in true_estimands"))
   }
   
-  # --- Data Preparation ---
+# -- Data Preparation -------------------------------------------------
   
   Odat_all <- Odat_all %>%
      mutate(log_base_falls = log1p(base_risk),                     
@@ -48,7 +45,7 @@ analyse_one_run <- function(file_path, sim_log, true_estimands, do_bootstrap = F
   
   Odat <- Odat_all %>% filter(observed)                          # observed data in the study
   
-  # --- Weights ---
+  # -- Weights --------------------------------------------------------------------
   # stabilised: numerator = baseline covariates + time (also in the outcome model)
   # ipwtm fitted on weeks without death; weights shifted by one week with lag_ipw()
   # unstabilised weights (no numerator) for the nonparametric mean number of falls
@@ -63,7 +60,7 @@ analyse_one_run <- function(file_path, sim_log, true_estimands, do_bootstrap = F
   max_weight_symtrain         <- max(Odat_w$w_symtrain, na.rm = TRUE)
   ess_sym <- sum(Odat_w$w_sym)^2 / sum(Odat_w$w_sym^2) / nrow(Odat_w)   # relative effective sample size
 
-  # --- Models ---
+  # -- Models ------------------------------------
   # prep_counting(): prepare data for counting data
   
   fits <- tryCatch(fit_models(Odat_all, Odat_w) , error = function(e) conditionMessage(e))
@@ -78,7 +75,7 @@ analyse_one_run <- function(file_path, sim_log, true_estimands, do_bootstrap = F
     extract_model_results(fits[[m]], m, true_beta)
   }))
   
-  # --- Mean number of falls until week 52 (nonparametric and model estimate) ---
+  # -- Mean number of falls until week 52 (nonparametric and model estimate) --------------------------------
   
   # mean falls per arm (model-based = same model as the LWYY / GL row,
   # log(mu_1 / mu_0) is exactly the arm coefficient -> only the levels per arm are new)
@@ -102,7 +99,8 @@ analyse_one_run <- function(file_path, sim_log, true_estimands, do_bootstrap = F
            Bias       = Estimate - True_Beta)
   
   # nonparametric MCF per quarter of year (for time varying effect)
-  mcf_q <- bind_rows(
+  # only under H1: with beta = 0 there is no effect that could vary over time (true LogRR_Q* = 0)
+  mcf_q <- if (current_params$true_beta_arm[1] != 0) bind_rows(
     "0: Full data (oracle M0)" = weighted_mcf_q(Odat_all %>% mutate(w1 = 1), "w1", "n_falls_full", "death_full"),
     "1: Naive (Unweighted)"    = weighted_mcf_q(Odat_w %>% mutate(w1 = 1), "w1"),
     "3: IPCW sym"              = weighted_mcf_q(Odat_w, "wm_sym"),
@@ -120,7 +118,7 @@ analyse_one_run <- function(file_path, sim_log, true_estimands, do_bootstrap = F
     dplyr::select(Model, True_Beta, Estimate, Rate_Ratio, Bias, MCF_Control_hat, MCF_Intervention_hat)
   
   
-  # --- Extract ---
+  # -- Extract ------------------------------------------
   # LWYY / GL rows get their model-based mean falls in the same row
   results <- bind_rows(model_results %>% left_join(mcf_results, by = "Model"),
                        mcf_np, mcf_q)
@@ -167,9 +165,8 @@ analyse_one_run <- function(file_path, sim_log, true_estimands, do_bootstrap = F
         error = NA_character_
     )
 }
-# -----------------------------------------------------------------------
-# parallalise
-# -----------------------------------------------------------------------
+
+# --- parallalise ----------------------------------------------------------------
 
 sim_log <- read_csv("./results/00_simulation_log.csv", show_col_types = FALSE)
 true_estimands <- read_csv("./results/00_true_estimands.csv", show_col_types = FALSE)
@@ -219,9 +216,7 @@ all_results <- all_results %>% filter(is.na(error))
 
 write_csv(all_results, "./results/00_all_results_raw.csv")
 
-# -----------------------------------------------------------------------
-# Results (performance measures, Morris et al. 2019)
-# -----------------------------------------------------------------------
+# -- Results (performance measures) ---------------------------------------------
 # bias against the true value of each method, coverage with MCSE,
 # model SE vs empirical SE, nonparametric mean number of falls
 

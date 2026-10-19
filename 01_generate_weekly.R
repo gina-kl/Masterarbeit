@@ -47,7 +47,7 @@ sim_dag <- function(n, seed, arm_value = NA,
                     train_frailty_eff = 0.02,        # frailty reduction per training session
                     max_frailty_red = 0.5,           # maximal frailty reduction
                     eff_frailty_y = 0.4,             # effect frailty on falls
-                    eff_frailty_death = 0.6,          # effect frailty on death
+                    eff_frailty_death = 0.6,         # effect frailty on death
                     eff_frailty_drop = 0.6,          # effect frailty on dropout (informative)
                     eff_frailty_train = -0.8,        # effect frailty on training (<0: frail train less)
                     eff_L1_drop = 0.0                # observed baseline falls -> dropout (positive control)
@@ -313,12 +313,12 @@ base_scenarios <- expand_grid(
   n_pts = 1800,
   true_beta_arm = c(0.0, -0.4),          # H0 and H1
   drop_beta_arm = c(0.0, -1.0),          # 0 = same Dropout-Rate, -1.0 = control group drops out more often
-  mortality_level = c("none", "low", "high")    # "none" = no death, negligible and non-negligible mortality
+  mortality_level = c("none", "high")           # "none" = no death, "high" = non-negligible mortality
 ) %>%
   cross_join(scenarios_def) %>%
-  # control scenarios 3,4,5 not fully crossed: only H1, no and high mortality (2 x 2 = 4 instead of 12 each)
+  # control scenarios 3,4,5 not fully crossed: only H1 (2 x 2 = 4 instead of 8 each)
   filter(scenario_name %in% c("1_NoFrailty", "2_Informative") |
-           (true_beta_arm == -0.4 & mortality_level %in% c("none", "high"))) %>%
+           true_beta_arm == -0.4) %>%
   mutate(train_frailty_eff = ifelse(true_beta_arm == 0, 0, train_frailty_eff)) %>%   # strict H0: no effect via training either
   rowwise() %>%                          # calibration for each scenario separately
   mutate(
@@ -406,7 +406,7 @@ true_block <- function(p, block, n_chunk, seed) {
   fit_lwyy <- coxph(Surv(start, stop, status == 1) ~ arm + age + sex + log_base_falls,
                     data = ag, ties = "breslow")
   fit_gl   <- recreg(Event(start, stop, status) ~ arm + age + sex + log_base_falls + cluster(ID),
-                     data = ag, cause = 1, death.code = 3, cens.code = 0)
+                     data = ag, cause = 1, death.code = 3, cens.code = 0, control = list(tol = 1e-12))
   rm(ag)
   
   # without death (hypothetical)
@@ -441,7 +441,7 @@ registerDoParallel(cl)
 true_blocks <- foreach(j = seq_len(nrow(true_tasks)),
                        .combine = bind_rows,
                        .packages = c("simcausal", "dplyr", "tidyr", "survival", "mets"),
-                       .export = c("COEF", "sim_dag", "simulate_true", "prep_data_true", "true_block",
+                       .export = c("COEF", "sim_dag", "simulate_true", "prep_data_true", "tie_offset", "true_block",
                                    "unique_causal_scenarios", "true_tasks", "n_chunk_true")) %dopar% {
                                      i <- true_tasks$causal_id[j]
                                      k <- true_tasks$block[j]
@@ -454,8 +454,8 @@ stopCluster(cl)
 if (!dir.exists("./results")) dir.create("./results")
 saveRDS(true_blocks, "./results/00_true_blocks.rds")    # block results: check MC error, add blocks later
 
-# Monte Carlo SE over the blocks
-mcse <- function(x) if (length(x) > 1) sd(x) / sqrt(length(x)) else NA_real_
+# Monte Carlo SE over the blocks (SE=s/sqrt(n))
+mcse <- function(x) if (length(x) > 1) sd(x) / sqrt(length(x)) else NA_real_ 
 
 true_estimands_df <- true_blocks %>%
   group_by(causal_id) %>%

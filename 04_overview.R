@@ -19,7 +19,7 @@ true_estimands <- read_csv("./results/00_true_estimands.csv", show_col_types = F
 scenario_table <- sim_log %>%
   filter(sim_run == 1) %>%
   dplyr::select(scenario_id, scenario_name, n_pts, true_beta_arm, drop_beta_arm,
-         mortality_level, eff_frailty_y, eff_frailty_cens,
+         mortality_level, eff_frailty_y, eff_frailty_death,
          eff_frailty_drop,                                       # NEU 07.10.2026
          eff_frailty_train,
          Y_intercept, drop_intercept, death_intercept, train_intercept) %>%       # NEU 07.10.2026: calibrated intercepts
@@ -33,7 +33,9 @@ scenario_table <- sim_log %>%
   ) %>%
   mutate(
     scenario = sprintf("S%02d", scenario_id),                    # short name for plots
-    method   = ifelse(mortality_level == "high", "Ghosh-Lin", "LWYY")   # NEU 07.10.2026: "none" -> LWYY
+    # LWYY and Ghosh-Lin are fitted in all scenarios; without death both estimate the same
+    death_handling = ifelse(mortality_level == "none", "kein Tod (LWYY = GL)",
+                            "Tod: LWYY zensiert, GL terminal")
   )
 
 print(scenario_table, width = Inf)
@@ -41,8 +43,8 @@ print(scenario_table, width = Inf)
 
 # # save as html
 # scenario_gt <- scenario_table %>%
-#   dplyr::select(scenario, scenario_name, method, n_pts, true_beta_arm, drop_beta_arm,
-#                 mortality_level, report_prob, eff_frailty_y, eff_frailty_cens,
+#   dplyr::select(scenario, scenario_name, death_handling, n_pts, true_beta_arm, drop_beta_arm,
+#                 mortality_level, eff_frailty_y, eff_frailty_cens,
 #                 eff_frailty_drop,                                    
 #                 eff_frailty_train, True_RateRatio, True_LogRateRatio,
 #                 True_LogRateRatio_NoDeath) %>%
@@ -52,16 +54,14 @@ print(scenario_table, width = Inf)
 #                          eff_frailty_train, True_RateRatio, True_LogRateRatio,
 #                          True_LogRateRatio_NoDeath),
 #              decimals = 3) %>%
-#   fmt_percent(columns = report_prob, decimals = 0) %>%
 #   cols_label(
 #     scenario                  = "Szenario",
 #     scenario_name             = "Name",
-#     method                    = "Methode",
+#     death_handling            = "Tod",
 #     n_pts                     = "n",
 #     true_beta_arm             = "β (DGP)",
 #     drop_beta_arm             = "β Drop",
 #     mortality_level           = "Mortalität",
-#     report_prob               = "Report-Wkt.",
 #     eff_frailty_y             = "Frailty Y",
 #     eff_frailty_cens          = "Frailty Tod",       
 #     eff_frailty_drop          = "Frailty Dropout",   
@@ -88,7 +88,12 @@ print(scenario_table, width = Inf)
 # needs: Odat_all (weekly data of one simulated study, complete data until death)
 
 library(tidyverse)
-Odat_all <- current_file <- "./results/Odat_scen30_run0001.rds"   # 2_Informative, beta = -0.4, beta_C = -1, high mortality
+# choose the data set by its parameters, not by scenario number (numbers change with the design)
+current_file <- sim_log %>%
+  filter(scenario_name == "2_Informative", true_beta_arm == -0.4, drop_beta_arm == -1,
+         mortality_level == "high", sim_run == 1) %>%
+  pull(file_path)
+if (length(current_file) != 1) stop("data set not found (or not unique) in 00_simulation_log.csv")
 Odat_all <- readRDS(current_file)
 
 # one row per person
