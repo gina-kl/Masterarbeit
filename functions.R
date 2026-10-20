@@ -393,3 +393,35 @@ run_bootstrap <- function(Odat_all, n_boot){
 }
 
 
+#----------- Section 5: Cluster helpers -------------------------------
+
+# save an rds file atomically: first write to a temporary file, then rename
+# if a job is killed during saveRDS (time limit), only the .tmp file is broken -> the final file
+# either exists completely or not at all (a restart then simply computes it again)
+save_rds_atomic <- function(object, file) {
+  tmp <- paste0(file, ".tmp", Sys.getpid())
+  saveRDS(object, tmp)
+  if (!file.rename(tmp, file)) stop("could not rename ", tmp, " to ", file)
+  invisible(file)
+}
+
+# check that existing results were produced with the same code and settings
+# (on the cluster existing files are skipped after a restart -> without this check old results
+#  would be mixed with new ones after a change of the code or of the settings)
+# sig:  list with everything the results depend on
+# file: settings file, one per scenario (-> array tasks never write the same file)
+# file missing -> sig is saved; same sig -> ok; different sig -> stop (nothing is deleted automatically)
+check_settings <- function(sig, file, what = "Results") {
+  if (file.exists(file)) {
+    old <- readRDS(file)
+    if (!isTRUE(all.equal(old, sig))) {
+      stop(what, " in ", dirname(file), " were produced with other code/settings (see ", basename(file), ").\n",
+           "  Delete the old files and ", basename(file), " before starting a new run.")
+    }
+  } else {
+    save_rds_atomic(sig, file)
+  }
+  invisible(TRUE)
+}
+
+
