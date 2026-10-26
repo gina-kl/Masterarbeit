@@ -8,7 +8,7 @@
 
 #------------- Section 1: Data preparation -----------------------------------
 
-# Ties: falls of different persons at exavtly the same time
+# Ties: falls of different persons at exactly the same time
 # Different handled by coxph and mets 
 # Every fall time of a person is moved by the same small person-specific offset (0, eps) to the left
 # - deterministic, not related to the arm (golden ratio hash of ID)
@@ -25,7 +25,7 @@ prep_data_true <- function(dat, t.end = 52) {
     filter(t == 0) %>%
     transmute(ID, arm, age, sex, log_base_falls = log1p(L1))   # log(1 + falls in the year before)
   
-  wk <- dat %>%
+  wk <- dat %>%                                         # all study weeks without baseline week (t=0)
     filter(t >= 1) %>%
     group_by(ID) %>%
     mutate(death_time = suppressWarnings(min(t[Death == 1]))) %>%   # Inf = no death
@@ -33,15 +33,16 @@ prep_data_true <- function(dat, t.end = 52) {
     filter(t <= death_time)                                           # falls of the death week count
   
   falls <- wk %>%
-    filter(Yfull > 0) %>%
-    mutate(d = as.integer(t == death_time)) %>%
-    tidyr::uncount(Yfull, .id = "j", .remove = FALSE) %>%
+    filter(Yfull > 0) %>%            # only for weeks with min. 1 fall
+    mutate(d = as.integer(t == death_time)) %>%   # d=1, if death at end of week
+    tidyr::uncount(Yfull, .id = "j", .remove = FALSE) %>%           # k falls -> k rows
     transmute(ID, stop = t - 1 + j / (Yfull + d) - tie_offset(ID), status = 1L)   # no ties between persons
   
   ends <- wk %>%
     group_by(ID) %>%
     summarise(stop   = min(first(death_time), t.end) + 0.001,   # shortly after falls at the same time (as in prep_counting)
               status = ifelse(is.finite(first(death_time)), 3L, 0L), .groups = "drop") 
+  
   bind_rows(falls, ends) %>%
     arrange(ID, stop, status != 1L) %>%          # at equal times: fall before end of study
     group_by(ID) %>%
@@ -141,7 +142,13 @@ fit_models <- function(Odat_all, Odat_w){
     
     f_lwyy <- Surv(start, stop, status == 1) ~ arm + age + sex + log_base_falls + cluster(ID)
     f_gl   <- Event(start, stop, status) ~ arm + age + sex + log_base_falls + cluster(ID)
-    
+
+    # recreg optimiser (lava::NR): tol 1e-12 (default 1e-6 stops too early) and Armijo line search.
+    # Without line search, Newton-Raphson diverged (NaN) in rare data sets with one very frail
+    # person (50-60 falls), mostly GL 0. Armijo halves a step only if it does not decrease the
+    # objective enough -> same solution, normal fits unchanged
+    gl_ctrl <- list(tol = 1e-12, backtrack = "armijo")
+
     # GL: cens.model = ~ strata(arm) -> internal censoring Kaplan-Meier per arm
     list(
       "LWYY 0: Full data (oracle M0)" = coxph(f_lwyy, data = cp_full, ties = "breslow"),
@@ -149,14 +156,14 @@ fit_models <- function(Odat_all, Odat_w){
       "LWYY 3: IPCW sym"              = coxph(f_lwyy, data = cp, ties = "breslow", weights = cp$w_sym),
       "LWYY 4: IPCW sym_train"        = coxph(f_lwyy, data = cp, ties = "breslow", weights = cp$w_symtrain),
       "LWYY 5: IPCW oracle"           = coxph(f_lwyy, data = cp, ties = "breslow", weights = cp$w_oracle),
-      "GL 0: Full data (oracle M0)"   = recreg(f_gl, data = cp_full, cause = 1, death.code = 3, cens.code = 0, cens.model = ~ strata(arm), control = list(tol = 1e-12)),
-      "GL 1: Naive (Unweighted)"      = recreg(f_gl, data = cp, cause = 1, death.code = 3, cens.code = 0, cens.model = ~ strata(arm), control = list(tol = 1e-12)),
+      "GL 0: Full data (oracle M0)"   = recreg(f_gl, data = cp_full, cause = 1, death.code = 3, cens.code = 0, cens.model = ~ strata(arm), control = gl_ctrl),
+      "GL 1: Naive (Unweighted)"      = recreg(f_gl, data = cp, cause = 1, death.code = 3, cens.code = 0, cens.model = ~ strata(arm), control = gl_ctrl),
       "GL 3: IPCW sym"                = recreg(f_gl, data = cp, cause = 1, death.code = 3, cens.code = 0, cens.model = ~ strata(arm),
-                                               weights = cp$w_sym, control = list(tol = 1e-12)),
+                                               weights = cp$w_sym, control = gl_ctrl),
       "GL 4: IPCW sym_train"          = recreg(f_gl, data = cp, cause = 1, death.code = 3, cens.code = 0, cens.model = ~ strata(arm),
-                                               weights = cp$w_symtrain, control = list(tol = 1e-12)),
+                                               weights = cp$w_symtrain, control = gl_ctrl),
       "GL 5: IPCW oracle"             = recreg(f_gl, data = cp, cause = 1, death.code = 3, cens.code = 0, cens.model = ~ strata(arm),
-                                               weights = cp$w_oracle, control = list(tol = 1e-12))  # stricter convergence (default tol 1e-6 stops too early)
+                                               weights = cp$w_oracle, control = gl_ctrl)
     )
 }
 
@@ -166,7 +173,7 @@ fit_models <- function(Odat_all, Odat_w){
 # IPCW weights per arm (for 02_analyse_weekly.R. 03_mehrfach analyse and bootstrap)
 # iptwm fitted on weeks without death, lag_ipw shifts weigths by one week (falls of week t are observed before a dropout at its end)
 # w_* stabilised weights, wm_* for marginal mean (only time in numerator)
-# dat: observed weekly data (observed == TRUE) with tstop, log_base_falls, fall_rate_lag, train_rate_lag, frailty_t
+# dat: observed weekly data (observed == TRUE) with tstop, log_base_falls, log_falls_lag, train_rate_lag, frailty_t
 
 
 compute_weights <- function(dat){
@@ -180,7 +187,7 @@ compute_weights <- function(dat){
       
       w_sym <- shift(ipwtm(exposure = drop, family = "binomial", link = "logit",
         numerator = ~ age + sex + log_base_falls + ns(tstop, df = 3), 
-        denominator = ~ age + sex + log_base_falls + ns(tstop, df = 3) + fall_rate_lag,   
+        denominator = ~ age + sex + log_base_falls + ns(tstop, df = 3) + log_falls_lag,   
         id = ID, tstart = tstart,  # is ignored with family "binomial" 
         timevar = tstop,
         type = "cens",
@@ -196,11 +203,12 @@ compute_weights <- function(dat){
       # unstabilisied weights
       wm_sym <- shift(ipwtm(exposure = drop, family = "binomial", link = "logit",
                      numerator = ~ ns(tstop, df = 3), 
-                     denominator = ~ age + sex + log_base_falls + ns(tstop, df = 3) + fall_rate_lag,   
+                     denominator = ~ age + sex + log_base_falls + ns(tstop, df = 3) + log_falls_lag,   
                      id = ID, tstart = tstart,  # is ignored with family "binomial" 
                      timevar = tstop,
                      type = "cens",
                      data = d_fit))
+      
       wm_oracle <- shift(ipwtm(exposure = drop, family = "binomial", link = "logit",
                         numerator = ~ ns(tstop, df = 3), 
                         denominator = ~ age + sex + log_base_falls + ns(tstop, df = 3) + frailty_t,   
@@ -213,11 +221,12 @@ compute_weights <- function(dat){
       if(d_all$arm[1] == 1){
         w_symtrain <- shift(ipwtm(exposure = drop, family = "binomial", link = "logit",
                                   numerator   = ~ age + sex + log_base_falls + ns(tstop, df = 3),
-                                  denominator = ~ age + sex + log_base_falls + ns(tstop, df = 3) + fall_rate_lag + train_rate_lag,
+                                  denominator = ~ age + sex + log_base_falls + ns(tstop, df = 3) + log_falls_lag + train_rate_lag,  
                                   id = ID, tstart = tstart, timevar = tstop, type = "cens", data = d_fit))
+        # unstabilisied weights
         wm_symtrain <- shift(ipwtm(exposure = drop, family = "binomial", link = "logit",
                                    numerator   = ~ ns(tstop, df = 3),
-                                   denominator = ~ age + sex + log_base_falls + ns(tstop, df = 3) + fall_rate_lag + train_rate_lag,
+                                   denominator = ~ age + sex + log_base_falls + ns(tstop, df = 3) + log_falls_lag + train_rate_lag,  
                                    id = ID, tstart = tstart, timevar = tstop, type = "cens", data = d_fit))
       } else {                                       # control arm never trains -> same as sym
         w_symtrain  <- w_sym
@@ -314,7 +323,7 @@ model_mcf <- function(fit, base_cov, t.end = 52) {
     b    <- coef(fit)
     zbar <- fit$means[names(b)]
     sapply(0:1, function(a) {
-      X <- as.matrix(base_cov %>% mutate(arm = a) %>% dplyr::select(all_of(names(b))))
+      X <- as.matrix(base_cov %>% mutate(arm = a) %>% dplyr::select(all_of(names(b)))) # base_cov = ID, age, sex, log_base_falls
       H0_t * mean(exp(sweep(X, 2, zbar) %*% b))              # Lambda_0(tau; zbar) * mean(exp((X_i - zbar) b))
     })
   } else {                                                   # Ghosh-Lin

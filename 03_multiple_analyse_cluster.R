@@ -6,7 +6,11 @@
 #   for a local test with these columns set n_sim >= 2
 
 library(ipw)
-library(tidyverse)
+#single packages instead of tidyverse (tidyverse cannot be installed on the cluster)
+library(dplyr)
+library(tidyr)
+library(readr)
+library(tibble)
 library(magrittr)
 library(survival)
 library(splines)
@@ -18,6 +22,14 @@ source("cluster_setup.R") # run_on_cluster, n_cores_use, results_dir, part
 source("functions.R")   # expand_counting, prep_gl_data, extract_model_results,
 # lag_ipw, weighted_mcf, model_mcf
 source("GlobalVars.R")  # do_bootstrap, n_boot, boot_max_run, boot_scenarios, boot_seed_offset
+source("scenarios.R")   # base_scenarios of the chosen blocks (array task -> scenario_id)
+
+# array task k = k-th scenario of the chosen blocks (as in 01)
+scen_id <- NA
+if (run_on_cluster && !is.na(array_id)) {
+  if (!(array_id %in% seq_len(nrow(base_scenarios)))) stop("Array-Task ", array_id, " don't exist: only 1 - ", nrow(base_scenarios), " scenarios")
+  scen_id <- base_scenarios$scenario_id[array_id]
+}
 
 # -- all of analyse one function -------------------------------------------------------------------
 
@@ -28,7 +40,7 @@ analyse_one_run <- function(file_path, sim_log, true_estimands, do_bootstrap = F
   
   current_params <- sim_log %>% filter(file_path == !!file_path) # !! change file_name to variable
   
-  # rue values per method (one row per causal scenario)
+  # true values per method (one row per causal scenario)
   truth <- true_estimands %>%
     filter(Scenario_Name == current_params$scenario_name[1],
            Mortality     == current_params$mortality_level[1],
@@ -36,7 +48,7 @@ analyse_one_run <- function(file_path, sim_log, true_estimands, do_bootstrap = F
   
   if (nrow(truth) != 1) {
     return(tibble(file_path = file_path, error = "no exact match in true_estimands",
-                  scenario_id = current_params$scenario_id[1], sim_run = current_params$sim_run[1]))   # NEU: scenario_id, sim_run (completeness check)
+                  scenario_id = current_params$scenario_id[1], sim_run = current_params$sim_run[1]))   # scenario_id, sim_run (completeness check)
   }
   
   # -- Data Preparation -------------------------------------------------
@@ -44,7 +56,7 @@ analyse_one_run <- function(file_path, sim_log, true_estimands, do_bootstrap = F
   Odat_all <- Odat_all %>%
     mutate(log_base_falls = log1p(base_risk),                     
            tstop          = t,
-           fall_rate_lag  = cum_falls_lag / pmax(t - 1, 1)) %>%  # observed fall rate up to week t-1
+           log_falls_lag  = log1p(cum_falls_lag)) %>%            
     arrange(ID, t)
   
   Odat <- Odat_all %>% filter(observed)                          # observed data in the study
@@ -57,13 +69,13 @@ analyse_one_run <- function(file_path, sim_log, true_estimands, do_bootstrap = F
   
   if (!is.data.frame(Odat_w)) {
     return(tibble(file_path = file_path, error = paste("ipwtm ist fehlgeschlagen:", Odat_w),
-                  scenario_id = current_params$scenario_id[1], sim_run = current_params$sim_run[1]))   # NEU: scenario_id, sim_run
+                  scenario_id = current_params$scenario_id[1], sim_run = current_params$sim_run[1]))   
   }
   
   # weight diagnostics  
   max_weight                  <- max(Odat_w$w_sym, na.rm = TRUE)
   max_weight_symtrain         <- max(Odat_w$w_symtrain, na.rm = TRUE)
-  ess_sym <- sum(Odat_w$w_sym)^2 / sum(Odat_w$w_sym^2) / nrow(Odat_w)   # relative effective sample size
+  ess_sym <- sum(Odat_w$w_sym)^2 / sum(Odat_w$w_sym^2) / nrow(Odat_w)   # relative effective sample size(should be ~1)
   
   # -- Models ------------------------------------
   # prep_counting(): prepare data for counting data
@@ -163,6 +175,7 @@ analyse_one_run <- function(file_path, sim_log, true_estimands, do_bootstrap = F
       scenario_name     = current_params$scenario_name[1],
       sim_run           = current_params$sim_run[1],
       true_beta_arm_dgp = current_params$true_beta_arm[1],
+      effect            = current_params$effect[1],          # none / low / high
       drop_beta_arm     = current_params$drop_beta_arm[1],
       mortality_level   = current_params$mortality_level[1],
       max_weight                  = max_weight,
@@ -208,12 +221,12 @@ if (run_analyse) {   # cluster ------------- "analyse" -------------------------
 
   if (run_on_cluster) {
     # only scenario of this array task
-    sim_log <- sim_log %>% filter(scenario_id == array_id)
-    if (nrow(sim_log) == 0) stop("no data for scenario ", array_id, " in Log")   # NEU: typo
+    sim_log <- sim_log %>% filter(scenario_id == scen_id)                       
+    if (nrow(sim_log) == 0) stop("no data for scenario ", scen_id, " in Log")
 
     # existing chunks are only skipped if they were computed with the same code, settings,
     # true values and data (one settings file per scenario -> array tasks never write the same file)
-    data_sig_file <- file.path(results_dir, sprintf("00_data_settings_scen%02d.rds", array_id))
+    data_sig_file <- file.path(results_dir, sprintf("00_data_settings_scen%02d.rds", scen_id))   
     sig_ana <- list(
       code     = lapply(setNames(ana_funs, ana_funs), function(f) deparse(get(f))),   # deparse ignores comments
       settings = list(do_bootstrap = do_bootstrap, n_boot = n_boot, boot_max_run = boot_max_run,
@@ -225,7 +238,7 @@ if (run_analyse) {   # cluster ------------- "analyse" -------------------------
         as.list(),
       data     = if (file.exists(data_sig_file)) readRDS(data_sig_file) else NULL
     )
-    check_settings(sig_ana, file.path(chunk_dir, sprintf("settings_scen%02d.rds", array_id)),
+    check_settings(sig_ana, file.path(chunk_dir, sprintf("settings_scen%02d.rds", scen_id)),   
                    what = "Analysis chunks")
   } else {
     # time check (only local)
@@ -244,7 +257,7 @@ if (run_analyse) {   # cluster ------------- "analyse" -------------------------
   # cluster
   sim_log <- sim_log %>%
     mutate(chunk = if (run_on_cluster) {
-      sprintf("scen%02d_chunk%03d", scenario_id, (sim_run - 1) %/% chunk_size + 1)   # NEU: chunk_size (chunk_size_cluster did not exist)
+      sprintf("scen%02d_chunk%03d", scenario_id, (sim_run - 1) %/% chunk_size + 1)   
     } else {
       "local_all"                                   # local: all in ohne chunk
     })
@@ -268,7 +281,7 @@ if (run_analyse) {   # cluster ------------- "analyse" -------------------------
         i = idx,
         .combine = bind_rows,
         .packages = c("ipw", "survival", "splines", "mets", "dplyr", "tidyr", "readr"),
-        .export = c(ana_funs,                                                             # NEU: list from above
+        .export = c(ana_funs,                                                             
                     "do_bootstrap", "n_boot", "boot_max_run", "boot_scenarios", "boot_seed_offset")
       ) %dopar% {
         # every unexpected error (e.g. readRDS, MCF, extraction) only marks this run as failed,
@@ -284,7 +297,7 @@ if (run_analyse) {   # cluster ------------- "analyse" -------------------------
                                      sim_run     = sim_log$sim_run[i]))
       }
 
-      save_rds_atomic(res_chunk, chunk_file(ch))   # NEU: atomic -> no broken chunk file after a time limit
+      save_rds_atomic(res_chunk, chunk_file(ch))   # atomic -> no broken chunk file after a time limit
       cat(format(Sys.time(), "%H:%M:%S"), "Paket", ch, "fertig:", length(idx), "Läufe in",
           round(difftime(Sys.time(), t_ch, units = "mins"), 2), "Minuten\n")
     }
@@ -343,7 +356,7 @@ if (run_aggregate) {   # ---------------- "aggregate" ------------------------
   # model SE vs empirical SE, nonparametric mean number of falls
   
   aggregated_results <- all_results %>%
-    group_by(scenario_id, scenario_name, drop_beta_arm, mortality_level,
+    group_by(scenario_id, scenario_name, effect, drop_beta_arm, mortality_level,   
              true_beta_arm_dgp, Method, Model) %>%
     summarise(
       n_runs        = n(),
@@ -407,7 +420,7 @@ if (run_aggregate) {   # ---------------- "aggregate" ------------------------
 # 
 # Odat_test <- readRDS(sim_log$file_path[1]) %>%
 #   mutate(log_base_falls = log1p(base_risk), tstop = t,
-#          fall_rate_lag = cum_falls_lag / pmax(t - 1, 1)) %>%
+#          log_falls_lag = log1p(cum_falls_lag)) %>%
 #   arrange(ID, t)
 # 
 # set.seed(1)
