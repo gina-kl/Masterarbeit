@@ -36,6 +36,11 @@ target_dropout <- 0.20                                          # perc with drop
 target_death   <- c(none = 0, high = 0.02)                      # mortality per year (none = no death)
 target_train   <- 0.63                                          # share of persons training in week 1 (training arm)
 
+# proxy strength
+# synthetic proxy P(t) = FrailtyT(t) + noise, measured in both arms
+proxy_sd <- c(p1=1, p05=0.5, p2=2)
+proxy_seed <- 7e8
+proxy_scenarios <- c("2_Informative")
 
 
 # --- Variables for analyse -------------------------------

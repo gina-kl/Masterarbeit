@@ -29,9 +29,9 @@ scenarios_def <- tribble(
 # low:  realistic, marginal log RR about -0.26 in 2_Informative
 # high: former effect, marginal log RR about -0.58 in 2_Informative
 effect_def <- tribble(
-  ~effect, ~true_beta_arm, ~max_frailty_red,
+  ~effect, ~true_beta_arm, ~max_frailty_red, 
   "none",  0.0,            0.0,
-  "low",   -0.15,          0.18,       #log RR about -0.26 (RR 0.77)
+  "low",   -0.15,          0.18,       
   "high",  -0.4,           0.5
 )
 

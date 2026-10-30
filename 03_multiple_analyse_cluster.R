@@ -53,7 +53,40 @@ analyse_one_run <- function(file_path, sim_log, true_estimands) {
   # -- Data Preparation -------------------------------------------------
 
   Odat_all <- prep_odat(Odat_all)                                # log_base_falls, tstop, log_falls_lag (functions.R)
-  Odat     <- Odat_all %>% filter(observed)                      # observed data in the study
+
+  # synthetic proxy P(t) = FrailtyT(t) + sd * eps (GlobalVars.R: proxy_sd, proxy_seed, proxy_scenarios)
+  # one eps per person and week; seed of the complete data + offset -> same noise in all scenarios
+  # with the same causal parameters; the same eps for all three strengths -> the levels are paired
+  # only without mortality (there GL = LWYY -> only LWYY fits with P), no bootstrap for the P models (06)
+  use_proxy <- length(proxy_sd) > 0 &&
+    (is.null(proxy_scenarios) || current_params$scenario_name[1] %in% proxy_scenarios) &&
+    current_params$mortality_level[1] == "none"
+  if (use_proxy) {
+    set.seed(current_params$seed[1] + proxy_seed)
+    eps <- rnorm(nrow(Odat_all))
+    Odat_all <- Odat_all %>%
+      mutate(P_p2  = frailty_t + proxy_sd[["p2"]]  * eps,
+             P_p1  = frailty_t + proxy_sd[["p1"]]  * eps,
+             P_p05 = frailty_t + proxy_sd[["p05"]] * eps)
+  }
+
+  Odat     <- Odat_all %>% filter(observed) # observed data in the study
+
+  # realised strength of all proxies: correlation with the true frailty
+  #   L1: one row per person, with the baseline frailty
+  #   falls history, training share, P: over the observed person-weeks, with the current frailty FrailtyT(t)
+  #   training share only in the training arm and from week 2 on (before that it is 0 for everyone)
+  per_person <- Odat_all %>% filter(t == 1)
+  obs_train  <- Odat %>% filter(arm == 1, t > 1)
+  safe_cor   <- function(x, y) if (sd(x) > 0 && sd(y) > 0) cor(x, y) else NA_real_   # NA if one side is constant
+  proxy_cor <- tibble(
+    cor_L1        = safe_cor(per_person$log_base_falls, per_person$frailty),
+    cor_falls_lag = safe_cor(Odat$log_falls_lag, Odat$frailty_t),
+    cor_train     = safe_cor(obs_train$train_rate_lag, obs_train$frailty_t),
+    cor_P_p2      = if (use_proxy) safe_cor(Odat$P_p2,  Odat$frailty_t) else NA_real_,
+    cor_P_p1      = if (use_proxy) safe_cor(Odat$P_p1,  Odat$frailty_t) else NA_real_,
+    cor_P_p05     = if (use_proxy) safe_cor(Odat$P_p05, Odat$frailty_t) else NA_real_
+  )
 
   # realised dropout per arm (control arm calibrated to 20 %, training arm depends on beta_C and the frailty reduction)
   per_pt    <- Odat_all %>% distinct(ID, arm, ever_dropped)      # one row per person
@@ -65,7 +98,7 @@ analyse_one_run <- function(file_path, sim_log, true_estimands) {
   # ipwtm fitted on weeks without death; weights shifted by one week with lag_ipw()
   # unstabilised weights (no numerator) for the nonparametric mean number of falls
   # *_tr: truncated at the 99% percentile per arm (sensitivity analysis)
-  Odat_w <- tryCatch(compute_weights(Odat), error = function(e) conditionMessage(e))
+  Odat_w <- tryCatch(compute_weights(Odat, use_proxy = use_proxy), error = function(e) conditionMessage(e))
 
   if (!is.data.frame(Odat_w)) {
     return(tibble(file_path = file_path, error = paste("ipwtm ist fehlgeschlagen:", Odat_w),
@@ -74,7 +107,8 @@ analyse_one_run <- function(file_path, sim_log, true_estimands) {
 
   # weight diagnostics (before truncation): maximum, 99% percentile and relative effective sample size (should be ~1)
   # of the stabilised weights w_* (models) and the unstabilised weights wm_* (MCF), e.g. column max_wm_sym
-  w_cols <- c("w_sym", "w_symtrain", "w_oracle", "wm_sym", "wm_symtrain", "wm_oracle")
+  w_cols <- c("w_sym", "w_symtrain", "w_oracle", "wm_sym", "wm_symtrain", "wm_oracle",
+              if (use_proxy) c("w_P_p2", "w_P_p1", "w_P_p05", "wm_P_p2", "wm_P_p1", "wm_P_p05"))
   w_diag <- Odat_w %>%
     summarise(across(all_of(w_cols),
                      list(max = max,
@@ -85,7 +119,7 @@ analyse_one_run <- function(file_path, sim_log, true_estimands) {
   # -- Models ------------------------------------
   # prep_counting(): prepare data for counting data
 
-  fits <- tryCatch(fit_models(Odat_all, Odat_w) , error = function(e) conditionMessage(e))
+  fits <- tryCatch(fit_models(Odat_all, Odat_w, use_proxy), error = function(e) conditionMessage(e))
 
   if (!is.list(fits)) {
     return(tibble(file_path = file_path, error = paste("Models failed:", fits),
@@ -104,7 +138,7 @@ analyse_one_run <- function(file_path, sim_log, true_estimands) {
   # log(mu_1 / mu_0) is exactly the arm coefficient -> only the levels per arm are new)
   # true values: LWYY -> limit of the LWYY fit on complete data (MCF_LWYY_*, as True_Beta_LWYY),
   #              GL and nonparametric MCF -> real world with death (MCF_*)
-  mcf_est <- mcf_estimate(Odat_all, Odat_w, fits)
+  mcf_est <- mcf_estimate(Odat_all, Odat_w, fits, use_proxy)
 
   mcf_results <- tibble(Model                = sub("^MCF-", "", names(mcf_est)),
                         MCF_Control_hat      = sapply(mcf_est, `[`, 1),
@@ -118,7 +152,7 @@ analyse_one_run <- function(file_path, sim_log, true_estimands) {
   # robust SE of the log ratio from mets (mcf_mets, functions.R) -> CI, test and coverage as for LWYY / GL
   # mean falls of mets (MCF_*_mets) only as check against weighted_mcf (MCF_*_hat)
   mcf_np_est <- mcf_results %>% filter(startsWith(Model, "MCF"))
-  mets <- tryCatch(mcf_mets(Odat_all, Odat_w),                       # mets failed -> NA, run is kept
+  mets <- tryCatch(mcf_mets(Odat_all, Odat_w, use_proxy),            # mets failed -> NA, run is kept
                    error = function(e) tibble(Model = mcf_np_est$Model, MCF_Control_mets = NA_real_,
                                               MCF_Intervention_mets = NA_real_, SE_log_ratio = NA_real_))
   mcf_np_est <- mcf_np_est %>% left_join(mets, by = "Model")
@@ -131,24 +165,31 @@ analyse_one_run <- function(file_path, sim_log, true_estimands) {
   # nonparametric MCF per quarter of year (for time varying effect)
   # only under H1: with beta = 0 there is no effect that could vary over time (true LogRR_Q* = 0)
   q_breaks <- c(0, 13, 26, 39, 52)                                 # weeks
-  mcf_q <- if (current_params$true_beta_arm[1] != 0) bind_rows(
-    "0: Full data (oracle M0)" = weighted_mcf(Odat_all %>% mutate(w1 = 1), "w1", "n_falls_full", "death_full", breaks = q_breaks),
-    "1: Naive (Unweighted)"    = weighted_mcf(Odat_w %>% mutate(w1 = 1), "w1", breaks = q_breaks),
-    "3: IPCW sym"              = weighted_mcf(Odat_w, "wm_sym", breaks = q_breaks),
-    "4: IPCW sym_train"        = weighted_mcf(Odat_w, "wm_symtrain", breaks = q_breaks),
-    "5: IPCW oracle"           = weighted_mcf(Odat_w, "wm_oracle", breaks = q_breaks),
-    .id = "version") %>%
-    mutate(q = paste0("Q", period)) %>%                              # period 1-4 -> Q1-Q4
-    dplyr::select(-period) %>%
-    pivot_wider(names_from = arm, values_from = MCF, names_prefix = "arm") %>%
-    mutate(Model                = paste0("MCF-", q, " ", version),          # "MCF-Q1 3: IPCW sym" -> Method "MCF-Q1"
-           True_Beta            = vapply(q, function(x) truth[[paste0("LogRR_", x)]], numeric(1)),
-           Estimate             = log(arm1 / arm0),
-           Rate_Ratio           = exp(Estimate),
-           Bias                 = Estimate - True_Beta,
-           MCF_Control_hat      = arm0,
-           MCF_Intervention_hat = arm1) %>%
-    dplyr::select(Model, True_Beta, Estimate, Rate_Ratio, Bias, MCF_Control_hat, MCF_Intervention_hat)
+  mcf_q <- if (current_params$true_beta_arm[1] != 0) {
+    q_list <- list(
+      "0: Full data (oracle M0)" = weighted_mcf(Odat_all %>% mutate(w1 = 1), "w1", "n_falls_full", "death_full", breaks = q_breaks),
+      "1: Naive (Unweighted)"    = weighted_mcf(Odat_w %>% mutate(w1 = 1), "w1", breaks = q_breaks),
+      "3: IPCW sym"              = weighted_mcf(Odat_w, "wm_sym", breaks = q_breaks),
+      "4: IPCW sym_train"        = weighted_mcf(Odat_w, "wm_symtrain", breaks = q_breaks),
+      "5: IPCW oracle"           = weighted_mcf(Odat_w, "wm_oracle", breaks = q_breaks))
+    if (use_proxy) {
+      q_list[["8: IPCW sym+P sd=2"]]    <- weighted_mcf(Odat_w, "wm_P_p2",  breaks = q_breaks)
+      q_list[["9: IPCW sym+P sd=1"]]    <- weighted_mcf(Odat_w, "wm_P_p1",  breaks = q_breaks)
+      q_list[["10: IPCW sym+P sd=0.5"]] <- weighted_mcf(Odat_w, "wm_P_p05", breaks = q_breaks)
+    }
+    bind_rows(q_list, .id = "version") %>%
+      mutate(q = paste0("Q", period)) %>%                              # period 1-4 -> Q1-Q4
+      dplyr::select(-period) %>%
+      pivot_wider(names_from = arm, values_from = MCF, names_prefix = "arm") %>%
+      mutate(Model                = paste0("MCF-", q, " ", version),          # "MCF-Q1 3: IPCW sym" -> Method "MCF-Q1"
+             True_Beta            = vapply(q, function(x) truth[[paste0("LogRR_", x)]], numeric(1)),
+             Estimate             = log(arm1 / arm0),
+             Rate_Ratio           = exp(Estimate),
+             Bias                 = Estimate - True_Beta,
+             MCF_Control_hat      = arm0,
+             MCF_Intervention_hat = arm1) %>%
+      dplyr::select(Model, True_Beta, Estimate, Rate_Ratio, Bias, MCF_Control_hat, MCF_Intervention_hat)
+  }
 
 
   # -- Extract ------------------------------------------
@@ -158,6 +199,7 @@ analyse_one_run <- function(file_path, sim_log, true_estimands) {
 
   results %>%
     cross_join(w_diag) %>%                                  # weight diagnostics (one row) in every row
+    cross_join(proxy_cor) %>%                               # proxy strength (one row) in every row
     mutate(
       Method = sub(" .*", "", Model),                       # LWYY / GL / MCF
       file_path         = file_path,
@@ -236,7 +278,7 @@ if (run_analyse) {   # cluster ------------- "analyse" -------------------------
     i = seq_len(nrow(sim_log)),
     .combine = bind_rows,
     .packages = c("ipw", "survival", "splines", "mets", "dplyr", "tidyr", "readr"),
-    .export = ana_funs
+    .export = c(ana_funs, "proxy_sd", "proxy_seed", "proxy_scenarios")
   ) %dopar% {
     # every unexpected error (e.g. readRDS, MCF, extraction) only marks this run as failed,
     # otherwise foreach would stop and all runs of the scenario would be lost
@@ -358,6 +400,8 @@ if (run_aggregate) {   # ---------------- "aggregate" ------------------------
       # realised dropout per arm (mean over the runs)
       mean_drop_ctrl = mean(drop_ctrl, na.rm = TRUE),
       mean_drop_int  = mean(drop_int, na.rm = TRUE),
+      # realised proxy strength: mean over the runs, e.g. mean_cor_L1, mean_cor_P_p05 (NaN where not computed)
+      across(starts_with("cor_"), ~ mean(.x, na.rm = TRUE), .names = "mean_{.col}"),
       # weights (before truncation): mean over the runs of max, 99% percentile and relative ESS, e.g. mean_max_wm_sym
       across(matches("^(max|q99|ess)_w"), ~ mean(.x, na.rm = TRUE), .names = "mean_{.col}"),
       .groups = "drop"

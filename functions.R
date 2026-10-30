@@ -112,7 +112,7 @@ extract_model_results <- function(model, model_name, true_beta) {
 # same argument order as mcf_estimate(): fit_models(Odat_all, Odat_w)
 # fit LWYY and Gosh-Lin model with and without proxies
 
-fit_models <- function(Odat_all, Odat_w){
+fit_models <- function(Odat_all, Odat_w, use_proxy = FALSE){
     cp      <- prep_counting(Odat_w, "observed")
     cp_full <- prep_counting(Odat_all, "full")
 
@@ -127,7 +127,7 @@ fit_models <- function(Odat_all, Odat_w){
 
     # GL: cens.model = ~ strata(arm) -> internal censoring Kaplan-Meier per arm
     # 6 / 7: truncated weights (sensitivity analysis, see compute_weights())
-    list(
+    fits <- list(
       "LWYY 0: Full data (oracle M0)" = coxph(f_lwyy, data = cp_full, ties = "breslow"),
       "LWYY 1: Naive (Unweighted)"    = coxph(f_lwyy, data = cp, ties = "breslow"),
       "LWYY 3: IPCW sym"              = coxph(f_lwyy, data = cp, ties = "breslow", weights = cp$w_sym),
@@ -148,6 +148,14 @@ fit_models <- function(Odat_all, Odat_w){
       "GL 7: IPCW sym_train trunc"    = recreg(f_gl, data = cp, cause = 1, death.code = 3, cens.code = 0, cens.model = ~ strata(arm),
                                                weights = cp$w_symtrain_tr, control = gl_ctrl)
     )
+    
+    # 8 / 9 / 10: proxy variants sym + P (only if use_proxy = only without mortality), LWYY only (GL = LWYY without mortality)
+    if (use_proxy) {
+      fits[["LWYY 8: IPCW sym+P sd=2"]]    <- coxph(f_lwyy, data = cp, ties = "breslow", weights = cp$w_P_p2)
+      fits[["LWYY 9: IPCW sym+P sd=1"]]    <- coxph(f_lwyy, data = cp, ties = "breslow", weights = cp$w_P_p1)
+      fits[["LWYY 10: IPCW sym+P sd=0.5"]] <- coxph(f_lwyy, data = cp, ties = "breslow", weights = cp$w_P_p05)
+    }
+    fits
 }
 
 # ----------------- Section 3: Weights -------------------------------------
@@ -160,7 +168,7 @@ fit_models <- function(Odat_all, Odat_w){
 # dat: observed weekly data (observed == TRUE) with tstop, log_base_falls, log_falls_lag, train_rate_lag, frailty_t
 
 
-compute_weights <- function(dat, trunc_q = 0.99){
+compute_weights <- function(dat, trunc_q = 0.99, use_proxy = FALSE){
   dat %>%
     mutate(tstart = t - 1) %>%
     split(.$arm) %>%
@@ -215,6 +223,39 @@ compute_weights <- function(dat, trunc_q = 0.99){
       } else {                                       # control arm never trains -> same as sym
         w_symtrain  <- w_sym
         wm_symtrain <- wm_sym
+      }
+      # proxy variants sym + P (columns P_p2, P_p1, P_p05 are created in analyse_one_run(), 03)
+      # formulas written out: ipwtm reads them from its call
+      if (use_proxy) {
+        d_all$w_P_p2 <- shift(ipwtm(exposure = drop, family = "binomial", link = "logit",
+                                    numerator   = ~ age + sex + log_base_falls + ns(tstop, df = 3),
+                                    denominator = ~ age + sex + log_base_falls + ns(tstop, df = 3) + log_falls_lag + P_p2,
+                                    id = ID, tstart = tstart, timevar = tstop, type = "cens", data = d_fit))
+        d_all$wm_P_p2 <- shift(ipwtm(exposure = drop, family = "binomial", link = "logit",
+                                     numerator   = ~ ns(tstop, df = 3),
+                                     denominator = ~ age + sex + log_base_falls + ns(tstop, df = 3) + log_falls_lag + P_p2,
+                                     id = ID, tstart = tstart, timevar = tstop, type = "cens", data = d_fit))
+        
+        d_all$w_P_p1 <- shift(ipwtm(exposure = drop, family = "binomial", link = "logit",
+                                    numerator   = ~ age + sex + log_base_falls + ns(tstop, df = 3),
+                                    denominator = ~ age + sex + log_base_falls + ns(tstop, df = 3) + log_falls_lag + P_p1,
+                                    id = ID, tstart = tstart, timevar = tstop, type = "cens", data = d_fit))
+        d_all$wm_P_p1 <- shift(ipwtm(exposure = drop, family = "binomial", link = "logit",
+                                     numerator   = ~ ns(tstop, df = 3),
+                                     denominator = ~ age + sex + log_base_falls + ns(tstop, df = 3) + log_falls_lag + P_p1,
+                                     id = ID, tstart = tstart, timevar = tstop, type = "cens", data = d_fit))
+        
+        d_all$w_P_p05 <- shift(ipwtm(exposure = drop, family = "binomial", link = "logit",
+                                     numerator   = ~ age + sex + log_base_falls + ns(tstop, df = 3),
+                                     denominator = ~ age + sex + log_base_falls + ns(tstop, df = 3) + log_falls_lag + P_p05,
+                                     id = ID, tstart = tstart, timevar = tstop, type = "cens", data = d_fit))
+        d_all$wm_P_p05 <- shift(ipwtm(exposure = drop, family = "binomial", link = "logit",
+                                      numerator   = ~ ns(tstop, df = 3),
+                                      denominator = ~ age + sex + log_base_falls + ns(tstop, df = 3) + log_falls_lag + P_p05,
+                                      id = ID, tstart = tstart, timevar = tstop, type = "cens", data = d_fit))
+        
+        
+        
       }
       d_all %>% mutate(w_sym = w_sym, w_symtrain = w_symtrain, w_oracle = w_oracle,
                        wm_sym = wm_sym, wm_symtrain = wm_symtrain, wm_oracle = wm_oracle,
@@ -310,7 +351,7 @@ model_mcf <- function(fit, base_cov, t.end = 52) {
 # mean number of falls per arm: nonparametric (weighted_mcf) and, if fits are given,
 # model-based from all LWYY and GL fits of fit_models() (model_mcf)
 # result: list, one element c(control, intervention) per version
-mcf_estimate <- function(Odat_all, Odat_w, fits = NULL){
+mcf_estimate <- function(Odat_all, Odat_w, fits = NULL, use_proxy = FALSE){
   # non-parametric estimate
   mcf_list <- list(
     "MCF 0: Full data (oracle M0)" = weighted_mcf(Odat_all %>% mutate(w1 = 1), "w1", "n_falls_full", "death_full"), # w1 = 1: unweighted, Estimate without dropout
@@ -321,6 +362,11 @@ mcf_estimate <- function(Odat_all, Odat_w, fits = NULL){
     "MCF 6: IPCW sym trunc"        = weighted_mcf(Odat_w, "wm_sym_tr"),
     "MCF 7: IPCW sym_train trunc"  = weighted_mcf(Odat_w, "wm_symtrain_tr")
   )
+  if (use_proxy) {
+    mcf_list[["MCF 8: IPCW sym+P sd=2"]]    <- weighted_mcf(Odat_w, "wm_P_p2")
+    mcf_list[["MCF 9: IPCW sym+P sd=1"]]    <- weighted_mcf(Odat_w, "wm_P_p1")
+    mcf_list[["MCF 10: IPCW sym+P sd=0.5"]] <- weighted_mcf(Odat_w, "wm_P_p05")
+  }
   base_cov <- Odat_all %>% filter(t == 1) %>% dplyr::select(ID, age, sex, log_base_falls)   # one row per person
   c(
     lapply(mcf_list, function(mm) c(mm$MCF[mm$arm == 0], mm$MCF[mm$arm == 1])),
@@ -337,7 +383,7 @@ mcf_estimate <- function(Odat_all, Odat_w, fits = NULL){
 # cp: counting process data from prep_counting(), w: weight column (NULL = unweighted)
 # status 1 = fall (cause), 3 = death (terminal event), strata(arm) -> one estimate per arm
 mets_mcf <- function(cp, w = NULL, t.end = 52) {
-  wt  <- if (is.null(w)) rep(1, nrow(cp)) else cp[[w]]
+  wt  <- if (is.null(w)) rep(1, nrow(cp)) else cp[[w]]  # 1= unweighted
   fit <- recurrent_marginal(Event(start, stop, status) ~ strata(arm) + cluster(ID), data = cp,
                             cause = 1, death.code = 3, weights = wt)
   s <- summary(fit, times = t.end)$pbaseci   # one data frame per arm (0, 1)
@@ -347,7 +393,7 @@ mets_mcf <- function(cp, w = NULL, t.end = 52) {
 # nonparametric MCF with mets for every version (same names as mcf_estimate()):
 # - mean falls per arm, check against weighted_mcf (unweighted identical, weighted ~1e-5 because of tie_offset)
 # - robust SE of the log ratio log(mu_1 / mu_0), delta method, arms independent: se^2 = (se_1 / mu_1)^2 + (se_0 / mu_0)^2
-mcf_mets <- function(Odat_all, Odat_w) {
+mcf_mets <- function(Odat_all, Odat_w, use_proxy = FALSE) {
   cp      <- prep_counting(Odat_w, "observed")
   cp_full <- prep_counting(Odat_all, "full")
   m <- list(
@@ -359,12 +405,16 @@ mcf_mets <- function(Odat_all, Odat_w) {
     "MCF 6: IPCW sym trunc"        = mets_mcf(cp, "wm_sym_tr"),
     "MCF 7: IPCW sym_train trunc"  = mets_mcf(cp, "wm_symtrain_tr")
   )
+  if (use_proxy) {   # same names as in mcf_estimate() (joined by Model in 03)
+    m[["MCF 8: IPCW sym+P sd=2"]]    <- mets_mcf(cp, "wm_P_p2")
+    m[["MCF 9: IPCW sym+P sd=1"]]    <- mets_mcf(cp, "wm_P_p1")
+    m[["MCF 10: IPCW sym+P sd=0.5"]] <- mets_mcf(cp, "wm_P_p05")
+  }
   tibble(Model                 = names(m),
          MCF_Control_mets      = sapply(m, `[[`, "mu_0"),
          MCF_Intervention_mets = sapply(m, `[[`, "mu_1"),
          SE_log_ratio          = sapply(m, function(x) sqrt((x[["se_1"]] / x[["mu_1"]])^2 + (x[["se_0"]] / x[["mu_0"]])^2)))
 }
-
 
 #----------- Section 5: Bootstrap (06_bootstrap_cluster.R) -------------------------------------
 

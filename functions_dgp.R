@@ -255,6 +255,7 @@ simulate_scenario <- function(
 }
 
 
+
 #------------------- Section 3: Calibration of intercepts ----------------------------------##
 # The intercepts are chosen so that the rates in the whole population (with frailty) hit the targets
 # coefficients from COEF -> automatically the same as in sim_dag()
@@ -419,8 +420,11 @@ true_block <- function(p, block, n_chunk, seed) {
   # same models as in the analysis, fitted on the complete data of this block
   fit_lwyy <- coxph(Surv(start, stop, status == 1) ~ arm + age + sex + log_base_falls,
                     data = ag, ties = "breslow")
+  # Armijo line search as in fit_models() (gl_ctrl): without it Newton-Raphson diverged (NaN) in a block with one
+  # very frail person (144 falls, supp causal_id 12 block 158); normal blocks unchanged (difference < 1e-7)
   fit_gl   <- recreg(Event(start, stop, status) ~ arm + age + sex + log_base_falls + cluster(ID),
-                     data = ag, cause = 1, death.code = 3, cens.code = 0, control = list(tol = 1e-12))
+                     data = ag, cause = 1, death.code = 3, cens.code = 0,
+                     control = list(tol = 1e-12, backtrack = "armijo"))
 
   # model-based mean falls per arm of the LWYY fit (model_mcf, functions.R) = limit of the LWYY falls
   # on complete data, the same kind of true value as True_Beta_LWYY (death ends the risk set)
