@@ -1,9 +1,10 @@
 
 #-- Multiple Simulation: Analyse over all sceanrios and all runs -----------------------
-#   Requires: n_sim in 01.generate weekly > 1 
+#   Requires: n_sim in 01.generate weekly > 1
 #   all Odat_scen*_run*.rds data in results_dir (lokal ./results/, Cluster: Workspace)
 #   local n_sim = 1 (GlobalVars.R) -> empirical_SE, mcse_bias, SE_ratio are NA (sd of one value);
 #   for a local test with these columns set n_sim >= 2
+#   Bootstrap: own script 06_bootstrap_cluster.R, its results are joined here in "aggregate"
 
 library(ipw)
 #single packages instead of tidyverse (tidyverse cannot be installed on the cluster)
@@ -19,10 +20,9 @@ library(foreach)
 library(doParallel)
 
 source("cluster_setup.R") # run_on_cluster, n_cores_use, results_dir, part
-source("functions.R")   # expand_counting, prep_gl_data, extract_model_results,
-# lag_ipw, weighted_mcf, model_mcf
-source("GlobalVars.R")  # do_bootstrap, n_boot, boot_max_run, boot_scenarios, boot_seed_offset
-source("scenarios.R")   # base_scenarios of the chosen blocks (array task -> scenario_id)
+source("functions.R")     # analysis functions: prep_odat, compute_weights, fit_models, mcf_estimate, mcf_mets, ...
+source("GlobalVars.R")    # n_sim
+source("scenarios.R")     # base_scenarios of the chosen blocks (array task -> scenario_id)
 
 # array task k = k-th scenario of the chosen blocks (as in 01)
 scen_id <- NA
@@ -31,145 +31,135 @@ if (run_on_cluster && !is.na(array_id)) {
   scen_id <- base_scenarios$scenario_id[array_id]
 }
 
-# -- all of analyse one function -------------------------------------------------------------------
+# -- analyse function -------------------------------------------------------------------
 
-analyse_one_run <- function(file_path, sim_log, true_estimands, do_bootstrap = FALSE, n_boot = 200, boot_max_run = Inf,
-                            boot_scenarios = NULL, boot_seed_offset = 5e6) {
-  
+analyse_one_run <- function(file_path, sim_log, true_estimands) {
+
   Odat_all <- readRDS(file_path)
-  
+
   current_params <- sim_log %>% filter(file_path == !!file_path) # !! change file_name to variable
-  
+
   # true values per method (one row per causal scenario)
   truth <- true_estimands %>%
     filter(Scenario_Name == current_params$scenario_name[1],
            Mortality     == current_params$mortality_level[1],
            True_Beta_Arm == current_params$true_beta_arm[1])
-  
+
   if (nrow(truth) != 1) {
     return(tibble(file_path = file_path, error = "no exact match in true_estimands",
                   scenario_id = current_params$scenario_id[1], sim_run = current_params$sim_run[1]))   # scenario_id, sim_run (completeness check)
   }
-  
+
   # -- Data Preparation -------------------------------------------------
-  
-  Odat_all <- Odat_all %>%
-    mutate(log_base_falls = log1p(base_risk),                     
-           tstop          = t,
-           log_falls_lag  = log1p(cum_falls_lag)) %>%            
-    arrange(ID, t)
-  
-  Odat <- Odat_all %>% filter(observed)                          # observed data in the study
-  
+
+  Odat_all <- prep_odat(Odat_all)                                # log_base_falls, tstop, log_falls_lag (functions.R)
+  Odat     <- Odat_all %>% filter(observed)                      # observed data in the study
+
+  # realised dropout per arm (control arm calibrated to 20 %, training arm depends on beta_C and the frailty reduction)
+  per_pt    <- Odat_all %>% distinct(ID, arm, ever_dropped)      # one row per person
+  drop_ctrl <- mean(per_pt$ever_dropped[per_pt$arm == 0])
+  drop_int  <- mean(per_pt$ever_dropped[per_pt$arm == 1])
+
   # -- Weights --------------------------------------------------------------------
   # stabilised: numerator = baseline covariates + time (also in the outcome model)
   # ipwtm fitted on weeks without death; weights shifted by one week with lag_ipw()
   # unstabilised weights (no numerator) for the nonparametric mean number of falls
+  # *_tr: truncated at the 99% percentile per arm (sensitivity analysis)
   Odat_w <- tryCatch(compute_weights(Odat), error = function(e) conditionMessage(e))
-  
+
   if (!is.data.frame(Odat_w)) {
     return(tibble(file_path = file_path, error = paste("ipwtm ist fehlgeschlagen:", Odat_w),
-                  scenario_id = current_params$scenario_id[1], sim_run = current_params$sim_run[1]))   
+                  scenario_id = current_params$scenario_id[1], sim_run = current_params$sim_run[1]))
   }
-  
-  # weight diagnostics  
-  max_weight                  <- max(Odat_w$w_sym, na.rm = TRUE)
-  max_weight_symtrain         <- max(Odat_w$w_symtrain, na.rm = TRUE)
-  ess_sym <- sum(Odat_w$w_sym)^2 / sum(Odat_w$w_sym^2) / nrow(Odat_w)   # relative effective sample size(should be ~1)
-  
+
+  # weight diagnostics (before truncation): maximum, 99% percentile and relative effective sample size (should be ~1)
+  # of the stabilised weights w_* (models) and the unstabilised weights wm_* (MCF), e.g. column max_wm_sym
+  w_cols <- c("w_sym", "w_symtrain", "w_oracle", "wm_sym", "wm_symtrain", "wm_oracle")
+  w_diag <- Odat_w %>%
+    summarise(across(all_of(w_cols),
+                     list(max = max,
+                          q99 = ~ quantile(.x, 0.99, names = FALSE),
+                          ess = ~ sum(.x)^2 / sum(.x^2) / n()),
+                     .names = "{.fn}_{.col}"))
+
   # -- Models ------------------------------------
   # prep_counting(): prepare data for counting data
-  
+
   fits <- tryCatch(fit_models(Odat_all, Odat_w) , error = function(e) conditionMessage(e))
-  
+
   if (!is.list(fits)) {
-    return(tibble(file_path = file_path, error = paste("Models failed:", fits),                       
-                  scenario_id = current_params$scenario_id[1], sim_run = current_params$sim_run[1]))   
+    return(tibble(file_path = file_path, error = paste("Models failed:", fits),
+                  scenario_id = current_params$scenario_id[1], sim_run = current_params$sim_run[1]))
   }
-  
+
   # true value that belongs to each model
   model_results <- bind_rows(lapply(names(fits), function(m) {
     true_beta <- if (startsWith(m, "LWYY")) truth$True_Beta_LWYY else truth$True_Beta_GL
     extract_model_results(fits[[m]], m, true_beta)
   }))
-  
+
   # -- Mean number of falls until week 52 (nonparametric and model estimate) --------------------------------
-  
+
   # mean falls per arm (model-based = same model as the LWYY / GL row,
   # log(mu_1 / mu_0) is exactly the arm coefficient -> only the levels per arm are new)
-  # true values: LWYY -> world without death, GL and nonparametric MCF -> real world
+  # true values: LWYY -> limit of the LWYY fit on complete data (MCF_LWYY_*, as True_Beta_LWYY),
+  #              GL and nonparametric MCF -> real world with death (MCF_*)
   mcf_est <- mcf_estimate(Odat_all, Odat_w, fits)
-  
+
   mcf_results <- tibble(Model                = sub("^MCF-", "", names(mcf_est)),
                         MCF_Control_hat      = sapply(mcf_est, `[`, 1),
                         MCF_Intervention_hat = sapply(mcf_est, `[`, 2)) %>%
-    mutate(no_death              = startsWith(Model, "LWYY"),
-           true_mcf_control      = if_else(no_death, truth$MCF_Control_NoDeath,      truth$MCF_Control),
-           true_mcf_intervention = if_else(no_death, truth$MCF_Intervention_NoDeath, truth$MCF_Intervention)) %>%
-    dplyr::select(-no_death)
-  
+    mutate(lwyy                  = startsWith(Model, "LWYY"),
+           true_mcf_control      = if_else(lwyy, truth$MCF_LWYY_Control,      truth$MCF_Control),
+           true_mcf_intervention = if_else(lwyy, truth$MCF_LWYY_Intervention, truth$MCF_Intervention)) %>%
+    dplyr::select(-lwyy)
+
   # nonparametric MCF: own rows, estimate = log ratio of mean falls (real world)
-  mcf_np <- mcf_results %>%
-    filter(startsWith(Model, "MCF")) %>%
-    mutate(True_Beta  = truth$True_LogRateRatio,
-           Estimate   = log(MCF_Intervention_hat / MCF_Control_hat),
-           Rate_Ratio = exp(Estimate),
-           Bias       = Estimate - True_Beta)
-  
+  # robust SE of the log ratio from mets (mcf_mets, functions.R) -> CI, test and coverage as for LWYY / GL
+  # mean falls of mets (MCF_*_mets) only as check against weighted_mcf (MCF_*_hat)
+  mcf_np_est <- mcf_results %>% filter(startsWith(Model, "MCF"))
+  mets <- tryCatch(mcf_mets(Odat_all, Odat_w),                       # mets failed -> NA, run is kept
+                   error = function(e) tibble(Model = mcf_np_est$Model, MCF_Control_mets = NA_real_,
+                                              MCF_Intervention_mets = NA_real_, SE_log_ratio = NA_real_))
+  mcf_np_est <- mcf_np_est %>% left_join(mets, by = "Model")
+  mcf_np <- wald_results(mcf_np_est$Model,
+                         est       = log(mcf_np_est$MCF_Intervention_hat / mcf_np_est$MCF_Control_hat),
+                         se        = mcf_np_est$SE_log_ratio,
+                         true_beta = truth$True_LogRateRatio) %>%
+    left_join(mcf_np_est %>% dplyr::select(-SE_log_ratio), by = "Model")
+
   # nonparametric MCF per quarter of year (for time varying effect)
   # only under H1: with beta = 0 there is no effect that could vary over time (true LogRR_Q* = 0)
+  q_breaks <- c(0, 13, 26, 39, 52)                                 # weeks
   mcf_q <- if (current_params$true_beta_arm[1] != 0) bind_rows(
-    "0: Full data (oracle M0)" = weighted_mcf_q(Odat_all %>% mutate(w1 = 1), "w1", "n_falls_full", "death_full"),
-    "1: Naive (Unweighted)"    = weighted_mcf_q(Odat_w %>% mutate(w1 = 1), "w1"),
-    "3: IPCW sym"              = weighted_mcf_q(Odat_w, "wm_sym"),
-    "4: IPCW sym_train"        = weighted_mcf_q(Odat_w, "wm_symtrain"),
-    "5: IPCW oracle"           = weighted_mcf_q(Odat_w, "wm_oracle"),
+    "0: Full data (oracle M0)" = weighted_mcf(Odat_all %>% mutate(w1 = 1), "w1", "n_falls_full", "death_full", breaks = q_breaks),
+    "1: Naive (Unweighted)"    = weighted_mcf(Odat_w %>% mutate(w1 = 1), "w1", breaks = q_breaks),
+    "3: IPCW sym"              = weighted_mcf(Odat_w, "wm_sym", breaks = q_breaks),
+    "4: IPCW sym_train"        = weighted_mcf(Odat_w, "wm_symtrain", breaks = q_breaks),
+    "5: IPCW oracle"           = weighted_mcf(Odat_w, "wm_oracle", breaks = q_breaks),
     .id = "version") %>%
+    mutate(q = paste0("Q", period)) %>%                              # period 1-4 -> Q1-Q4
+    dplyr::select(-period) %>%
     pivot_wider(names_from = arm, values_from = MCF, names_prefix = "arm") %>%
     mutate(Model                = paste0("MCF-", q, " ", version),          # "MCF-Q1 3: IPCW sym" -> Method "MCF-Q1"
-           True_Beta            = vapply(as.character(q), function(x) truth[[paste0("LogRR_", x)]], numeric(1)),
+           True_Beta            = vapply(q, function(x) truth[[paste0("LogRR_", x)]], numeric(1)),
            Estimate             = log(arm1 / arm0),
            Rate_Ratio           = exp(Estimate),
            Bias                 = Estimate - True_Beta,
            MCF_Control_hat      = arm0,
            MCF_Intervention_hat = arm1) %>%
     dplyr::select(Model, True_Beta, Estimate, Rate_Ratio, Bias, MCF_Control_hat, MCF_Intervention_hat)
-  
-  
+
+
   # -- Extract ------------------------------------------
   # LWYY / GL rows get their model-based mean falls in the same row
   results <- bind_rows(model_results %>% left_join(mcf_results, by = "Model"),
                        mcf_np, mcf_q)
-  
-  
-  # --- Bootstrap (if set in GlobalVars.R)----------
-  # only for runs with sim_run <= boot_max_run in the scenarios boot_scenarios (NULL = all)
-  # columns always exist (NA without bootstrap) -> aggregation works in both cases
-  
-  boot_res <- NULL
-  boot_this_run <- do_bootstrap && current_params$sim_run[1] <= boot_max_run &&
-    (is.null(boot_scenarios) || current_params$scenario_name[1] %in% boot_scenarios)
-  if (boot_this_run) {
-    set.seed(current_params$seed[1] + boot_seed_offset)
-    boot_res <- tryCatch(run_bootstrap(Odat_all, n_boot), error = function(e) NULL)   # failed -> NA, run is kept
-  }
-  if (is.null(boot_res)) {
-    boot_res <- tibble(Model = results$Model, Boot_SE = NA_real_, Boot_CI_low = NA_real_,
-                       Boot_CI_high = NA_real_, n_boot_ok = NA_real_)
-  }
-  
-  
-  
+
   results %>%
-    left_join(boot_res, by = "Model") %>%   # join with bootstrap results
+    cross_join(w_diag) %>%                                  # weight diagnostics (one row) in every row
     mutate(
-      Boot_Covered_wald = Estimate - qnorm(0.975) * Boot_SE <= True_Beta &
-        True_Beta <= Estimate + qnorm(0.975) * Boot_SE,     # Wald CI with bootstrap SE
-      Boot_Covered_perc = Boot_CI_low <= True_Beta & True_Beta <= Boot_CI_high,  # percentile CI
-      Boot_Reject       = 2 * pnorm(-abs(Estimate / Boot_SE)) < 0.05,         # Wald test with bootstrap SE
-      Boot_Reject_perc  = Boot_CI_high < 0 | Boot_CI_low > 0,                 # 0 outside the percentile CI (two-sided)
-      
-      Method = sub(" .*", "", Model),                       # LWYY / GL / MCF 
+      Method = sub(" .*", "", Model),                       # LWYY / GL / MCF
       file_path         = file_path,
       scenario_id       = current_params$scenario_id[1],
       scenario_name     = current_params$scenario_name[1],
@@ -178,9 +168,8 @@ analyse_one_run <- function(file_path, sim_log, true_estimands, do_bootstrap = F
       effect            = current_params$effect[1],          # none / low / high
       drop_beta_arm     = current_params$drop_beta_arm[1],
       mortality_level   = current_params$mortality_level[1],
-      max_weight                  = max_weight,
-      max_weight_symtrain         = max_weight_symtrain,
-      ess_sym                     = ess_sym,
+      drop_ctrl         = drop_ctrl,                         # realised dropout per arm
+      drop_int          = drop_int,
       error = NA_character_
     )
 }
@@ -192,24 +181,22 @@ run_aggregate <- part %in% c("all", "aggregate")
 
 if (!run_analyse && !run_aggregate) stop("03_multiple_analyse: argument must be 'analyse' or 'aggregate', not: ", part)
 
-# cluster: results are saved in chunks
-# if one job is cancelled (time), only remaining chunks are computed
-# local: one chunk with all runs
-chunk_size <- 96   # multiple of 16,24,..( no half-empty last round per chunk)
-chunk_dir  <- file.path(results_dir, "analysis_chunks")
-dir.create(chunk_dir, showWarnings = FALSE, recursive = TRUE)
-chunk_file <- function(ch) file.path(chunk_dir, paste0("res_", ch, ".rds"))
+# results: one file per scenario (cluster) or one file for all (local)
+# every job computes its scenario completely and overwrites the old file
+# (a scenario takes about 20-30 min on the cluster -> after a time limit the scenario is simply computed again)
+res_dir <- file.path(results_dir, "analysis")
+dir.create(res_dir, showWarnings = FALSE, recursive = TRUE)
 
-# functions needed on the workers (one list for .export and for the settings check)
-ana_funs <- c("analyse_one_run", "extract_model_results", "prep_counting", "lag_ipw", "weighted_mcf", "compute_weights",
-              "model_mcf", "fit_models", "mcf_estimate", "boot_sample", "boot_estimate", "run_bootstrap",
-              "weighted_mcf_q", "tie_offset")
+# functions needed on the workers
+ana_funs <- c("analyse_one_run", "prep_odat", "extract_model_results", "wald_results", "prep_counting", "lag_ipw",
+              "weighted_mcf", "compute_weights", "trunc_w", "model_mcf", "fit_models", "mcf_estimate",
+              "mets_mcf", "mcf_mets", "tie_offset")
 
 
 # --- parallalise ----------------------------------------------------------------
 
 if (run_analyse) {   # cluster ------------- "analyse" ----------------------------
-  
+
   # local 00_simulation_log.csv, cluster 00_simulation_log_scenXX.csv
   log_files <- list.files(results_dir, pattern = "^00_simulation_log.*\\.csv$", full.names = TRUE)
   if (length(log_files) == 0) stop("no Simulationslog in ", results_dir, " - first run 01_generate")
@@ -221,142 +208,123 @@ if (run_analyse) {   # cluster ------------- "analyse" -------------------------
 
   if (run_on_cluster) {
     # only scenario of this array task
-    sim_log <- sim_log %>% filter(scenario_id == scen_id)                       
+    sim_log <- sim_log %>% filter(scenario_id == scen_id)
     if (nrow(sim_log) == 0) stop("no data for scenario ", scen_id, " in Log")
-
-    # existing chunks are only skipped if they were computed with the same code, settings,
-    # true values and data (one settings file per scenario -> array tasks never write the same file)
-    data_sig_file <- file.path(results_dir, sprintf("00_data_settings_scen%02d.rds", scen_id))   
-    sig_ana <- list(
-      code     = lapply(setNames(ana_funs, ana_funs), function(f) deparse(get(f))),   # deparse ignores comments
-      settings = list(do_bootstrap = do_bootstrap, n_boot = n_boot, boot_max_run = boot_max_run,
-                      boot_scenarios = boot_scenarios, boot_seed_offset = boot_seed_offset,
-                      chunk_size = chunk_size),
-      truth    = true_estimands %>%
-        semi_join(sim_log %>% distinct(scenario_name, mortality_level, true_beta_arm),
-                  by = c(Scenario_Name = "scenario_name", Mortality = "mortality_level", True_Beta_Arm = "true_beta_arm")) %>%
-        as.list(),
-      data     = if (file.exists(data_sig_file)) readRDS(data_sig_file) else NULL
-    )
-    check_settings(sig_ana, file.path(chunk_dir, sprintf("settings_scen%02d.rds", scen_id)),   
-                   what = "Analysis chunks")
+    res_file <- file.path(res_dir, sprintf("res_scen%02d.rds", scen_id))   # an old file is overwritten
   } else {
     # time check (only local)
     t1 <- Sys.time()
     test_result <- analyse_one_run(sim_log$file_path[1], sim_log, true_estimands)
     print(Sys.time() - t1)
     print(test_result)
-    
+
     # Optional zum Testen: erstmal nur eine Teilmenge laufen lassen, z.B.:
     #sim_log <- sim_log %>% filter(sim_run <= 2)
-    
-    # lokal remove old chunks
-    file.remove(list.files(chunk_dir, full.names = TRUE))
-  }
-  
-  # cluster
-  sim_log <- sim_log %>%
-    mutate(chunk = if (run_on_cluster) {
-      sprintf("scen%02d_chunk%03d", scenario_id, (sim_run - 1) %/% chunk_size + 1)   
-    } else {
-      "local_all"                                   # local: all in ohne chunk
-    })
-  chunks <- unique(sim_log$chunk)
-  todo   <- chunks[!file.exists(chunk_file(chunks))]
-  cat(length(chunks) - length(todo), "von", length(chunks), "package finished,",
-      length(todo), "to compute (", nrow(sim_log), "runs)\n")
-  
-  if (length(todo) > 0) {
-    
-    cl <- makeCluster(n_cores_use)   
-    registerDoParallel(cl)
-    
-    t_start <- Sys.time()
-    
-    for (ch in todo) {               
-      idx <- which(sim_log$chunk == ch)
-      t_ch <- Sys.time()
-      
-      res_chunk <- foreach(
-        i = idx,
-        .combine = bind_rows,
-        .packages = c("ipw", "survival", "splines", "mets", "dplyr", "tidyr", "readr"),
-        .export = c(ana_funs,                                                             
-                    "do_bootstrap", "n_boot", "boot_max_run", "boot_scenarios", "boot_seed_offset")
-      ) %dopar% {
-        # every unexpected error (e.g. readRDS, MCF, extraction) only marks this run as failed,
-        # before, foreach stopped and the whole chunk was lost (and failed again after every restart)
-        tryCatch(
-          # named arguments: no mix-up of the order
-          analyse_one_run(sim_log$file_path[i], sim_log, true_estimands,
-                          do_bootstrap = do_bootstrap, n_boot = n_boot, boot_max_run = boot_max_run,
-                          boot_scenarios = boot_scenarios, boot_seed_offset = boot_seed_offset),
-          error = function(e) tibble(file_path   = sim_log$file_path[i],
-                                     error       = paste("unexpected error:", conditionMessage(e)),
-                                     scenario_id = sim_log$scenario_id[i],
-                                     sim_run     = sim_log$sim_run[i]))
-      }
 
-      save_rds_atomic(res_chunk, chunk_file(ch))   # atomic -> no broken chunk file after a time limit
-      cat(format(Sys.time(), "%H:%M:%S"), "Paket", ch, "fertig:", length(idx), "Läufe in",
-          round(difftime(Sys.time(), t_ch, units = "mins"), 2), "Minuten\n")
-    }
-    
-    stopCluster(cl)
-    
-    t_end <- Sys.time()
-    cat("Laufzeit gesamt:", round(difftime(t_end, t_start, units = "mins"), 2), "Minuten\n")
-    
-  }   # Ende if (length(todo) > 0)
-  
+    # lokal remove old results
+    file.remove(list.files(res_dir, full.names = TRUE))
+    res_file <- file.path(res_dir, "res_local.rds")
+  }
+
+  cl <- makeCluster(n_cores_use)
+  registerDoParallel(cl)
+
+  t_start <- Sys.time()
+  cat("Start analysis:", nrow(sim_log), "runs on", n_cores_use, "cores\n")
+
+  res <- foreach(
+    i = seq_len(nrow(sim_log)),
+    .combine = bind_rows,
+    .packages = c("ipw", "survival", "splines", "mets", "dplyr", "tidyr", "readr"),
+    .export = ana_funs
+  ) %dopar% {
+    # every unexpected error (e.g. readRDS, MCF, extraction) only marks this run as failed,
+    # otherwise foreach would stop and all runs of the scenario would be lost
+    tryCatch(
+      analyse_one_run(sim_log$file_path[i], sim_log, true_estimands),
+      error = function(e) tibble(file_path   = sim_log$file_path[i],
+                                 error       = paste("unexpected error:", conditionMessage(e)),
+                                 scenario_id = sim_log$scenario_id[i],
+                                 sim_run     = sim_log$sim_run[i]))
+  }
+
+  stopCluster(cl)
+  save_rds_atomic(res, res_file)   # atomic -> no broken result file after a time limit
+
+  cat("Laufzeit gesamt:", round(difftime(Sys.time(), t_start, units = "mins"), 2), "Minuten\n")
+
 }   # --------- end of "analyse" ------------------------------------------------
 
 
 if (run_aggregate) {   # ---------------- "aggregate" ------------------------
-  
-   chunk_files <- list.files(chunk_dir, pattern = "^res_.*\\.rds$", full.names = TRUE)
-  if (length(chunk_files) == 0) stop("Keine Analyse-Ergebnisse in ", chunk_dir)
-  all_results <- bind_rows(lapply(chunk_files, readRDS))
-  
+
+  # only the result files of the scenarios in the chosen blocks (old files of other designs are not read)
+  res_files <- if (run_on_cluster) {
+    file.path(res_dir, sprintf("res_scen%02d.rds", base_scenarios$scenario_id))
+  } else {
+    file.path(res_dir, "res_local.rds")
+  }
+  res_files <- res_files[file.exists(res_files)]
+  if (length(res_files) == 0) stop("Keine Analyse-Ergebnisse in ", res_dir)
+  all_results <- bind_rows(lapply(res_files, readRDS))
+
   # check if complete
   # failed runs now also have scenario_id -> they count as analysed and are no extra NA group
   runs_per_scen <- all_results %>% distinct(scenario_id, file_path) %>% count(scenario_id, name = "n_runs")
   cat("analysed runs per scenario (expected per", n_sim, "):\n")
   print(runs_per_scen, n = 100)
-  # expected scenarios from 00_base_scenarios.csv (written by 01, part "true") instead of the fixed 28
-  base_file <- file.path(results_dir, "00_base_scenarios.csv")
-  if (file.exists(base_file)) {
-    expected_ids <- read_csv(base_file, show_col_types = FALSE)$scenario_id
-    missing_ids  <- setdiff(expected_ids, runs_per_scen$scenario_id)
-    if (length(missing_ids) > 0) {
-      warning("Scenarios without results: ", paste(missing_ids, collapse = ", "), " - start these analyse tasks again")
-    }
-  } else {
-    warning(base_file, " missing - number of scenarios not checked")
+  missing_ids <- setdiff(base_scenarios$scenario_id, runs_per_scen$scenario_id)   # scenarios of the chosen blocks
+  if (length(missing_ids) > 0) {
+    warning("Scenarios without results: ", paste(missing_ids, collapse = ", "), " - start these analyse tasks again")
   }
   if (any(runs_per_scen$n_runs < n_sim)) {
     warning("Not all runs analysed in scenario(s) ",
             paste(runs_per_scen$scenario_id[runs_per_scen$n_runs < n_sim], collapse = ", "),
             " - start these analyse tasks again")
   }
-  
+
   # check failed runs
   failed_runs <- all_results %>% filter(!is.na(error))
   if (nrow(failed_runs) > 0) {
     cat(nrow(failed_runs), "Läufe sind fehlgeschlagen:\n")
     print(failed_runs %>% dplyr::select(file_path, error) %>% distinct())
   }
-  
+
   all_results <- all_results %>% filter(is.na(error))
-  
+
+  # check: nonparametric MCF of mets = weighted_mcf (largest difference over all runs and both arms)
+  d_mets <- abs(c(all_results$MCF_Control_mets - all_results$MCF_Control_hat,
+                  all_results$MCF_Intervention_mets - all_results$MCF_Intervention_hat))
+  cat("largest difference mets - weighted_mcf:", if (all(is.na(d_mets))) NA else max(d_mets, na.rm = TRUE), "\n")
+
+  # -- Bootstrap (06_bootstrap_cluster.R): one file per run, joined by scenario, run and model ------------
+  # runs / models without bootstrap -> NA
+  boot_files <- list.files(file.path(results_dir, "boot"), pattern = "^boot_.*\\.rds$", full.names = TRUE)
+  boot_res   <- bind_rows(lapply(boot_files, readRDS))
+  if (nrow(boot_res) == 0) {
+    boot_res <- tibble(scenario_id = numeric(), sim_run = numeric(), Model = character(), Boot_SE = numeric(),
+                       Boot_CI_low = numeric(), Boot_CI_high = numeric(), n_boot_ok = numeric())
+  }
+  cat(n_distinct(boot_res[c("scenario_id", "sim_run")]), "runs with bootstrap\n")
+
+  all_results <- all_results %>%
+    left_join(boot_res, by = c("scenario_id", "sim_run", "Model")) %>%
+    mutate(
+      Boot_Covered_wald = Estimate - qnorm(0.975) * Boot_SE <= True_Beta &
+        True_Beta <= Estimate + qnorm(0.975) * Boot_SE,     # Wald CI with bootstrap SE
+      Boot_Covered_perc = Boot_CI_low <= True_Beta & True_Beta <= Boot_CI_high,  # percentile CI
+      Boot_Reject       = 2 * pnorm(-abs(Estimate / Boot_SE)) < 0.05,         # Wald test with bootstrap SE
+      Boot_Reject_perc  = Boot_CI_high < 0 | Boot_CI_low > 0                  # 0 outside the percentile CI (two-sided)
+    )
+
   write_csv(all_results, file.path(results_dir, "00_all_results_raw.csv"))   # cluster: results_dir
-  
+
   # -- Results (performance measures) ---------------------------------------------
   # bias against the true value of each method, coverage with MCSE,
   # model SE vs empirical SE, nonparametric mean number of falls
-  
+
   aggregated_results <- all_results %>%
-    group_by(scenario_id, scenario_name, effect, drop_beta_arm, mortality_level,   
+    group_by(scenario_id, scenario_name, effect, drop_beta_arm, mortality_level,
              true_beta_arm_dgp, Method, Model) %>%
     summarise(
       n_runs        = n(),
@@ -365,13 +333,13 @@ if (run_aggregate) {   # ---------------- "aggregate" ------------------------
       mean_bias     = mean(Bias, na.rm = TRUE),
       mcse_bias     = sd(Estimate, na.rm = TRUE) / sqrt(n_runs),         # Monte Carlo SE of the bias
       empirical_SE  = sd(Estimate, na.rm = TRUE),
-      mean_model_SE = mean(SE, na.rm = TRUE),                            # robust sandwich SE (NA for MCF)
+      mean_model_SE = mean(SE, na.rm = TRUE),                            # robust sandwich SE (MCF: robust SE from mets)
       SE_ratio      = mean_model_SE / empirical_SE,                      # ~1: SE fits
       RMSE          = sqrt(mean(Bias^2, na.rm = TRUE)),
-      coverage      = mean(Covered, na.rm = TRUE),                       # nominal 0.95 (NA for MCF)
+      coverage      = mean(Covered, na.rm = TRUE),                       # nominal 0.95 (NA for MCF per quarter)
       mcse_coverage = sqrt(coverage * (1 - coverage) / n_runs),
       power = mean(Reject, na.rm = TRUE),                       # beta = -0.4 -> power
-      # bootstrap (only runs with bootstrap; NaN / 0 if do_bootstrap = FALSE)
+      # bootstrap (only runs with bootstrap; NaN / 0 without bootstrap)
       n_boot_runs        = sum(!is.na(Boot_SE)),
       mean_n_boot_ok     = mean(n_boot_ok, na.rm = TRUE),                # successful bootstrap samples per run
       mean_boot_SE       = mean(Boot_SE, na.rm = TRUE),
@@ -387,16 +355,17 @@ if (run_aggregate) {   # ---------------- "aggregate" ------------------------
       mean_mcf_intervention = mean(MCF_Intervention_hat, na.rm = TRUE),
       bias_mcf_control      = mean_mcf_control - true_mcf_control,
       bias_mcf_intervention = mean_mcf_intervention - true_mcf_intervention,
-      # weights
-      mean_max_weight                  = mean(max_weight, na.rm = TRUE),
-      mean_max_weight_symtrain         = mean(max_weight_symtrain, na.rm = TRUE),   
-      mean_ess_sym                     = mean(ess_sym, na.rm = TRUE),
+      # realised dropout per arm (mean over the runs)
+      mean_drop_ctrl = mean(drop_ctrl, na.rm = TRUE),
+      mean_drop_int  = mean(drop_int, na.rm = TRUE),
+      # weights (before truncation): mean over the runs of max, 99% percentile and relative ESS, e.g. mean_max_wm_sym
+      across(matches("^(max|q99|ess)_w"), ~ mean(.x, na.rm = TRUE), .names = "mean_{.col}"),
       .groups = "drop"
     ) %>%
     arrange(scenario_id, Model)
-  
+
   print(aggregated_results, n = 100)
-  
+
   write_csv(aggregated_results, file.path(results_dir, "00_aggregated_results.csv"))   # cluster:  results_dir
 
   # cluster: one combined log 00_simulation_log.csv (as written locally by 01) with paths "./results/<file>"
@@ -408,29 +377,9 @@ if (run_aggregate) {   # ---------------- "aggregate" ------------------------
       arrange(scenario_id, sim_run) %>%
       write_csv(file.path(results_dir, "00_simulation_log.csv"))
   }
-  
+
   cat("\nFertig. Ergebnisse gespeichert in:\n")
   cat(" -", file.path(results_dir, "00_all_results_raw.csv"), "(jede einzelne Schätzung)\n")
   cat(" -", file.path(results_dir, "00_aggregated_results.csv"), "(Bias/RMSE/Coverage pro Szenario)\n")
-  
+
 }   # -----------------end of  "aggregate" ----------------------------------------------
-
-
-# # Test for one bootstrap
-# 
-# Odat_test <- readRDS(sim_log$file_path[1]) %>%
-#   mutate(log_base_falls = log1p(base_risk), tstop = t,
-#          log_falls_lag = log1p(cum_falls_lag)) %>%
-#   arrange(ID, t)
-# 
-# set.seed(1)
-# bs <- boot_sample(Odat_test)
-# 
-# # Kontrollen der Stichprobe
-# n_distinct(bs$ID) == n_distinct(Odat_test$ID)        # gleiche Personenzahl -> TRUE
-# table(distinct(bs, ID, arm)$arm)                     # Armgrößen wie im Original
-# table(distinct(Odat_test, ID, arm)$arm)
-# system.time(est <- boot_estimate(bs))               # Laufzeit EINER Stichprobe
-# est                                                  # 25 benannte Werte, möglichst ohne NA
-# 
-# 

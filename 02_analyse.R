@@ -1,11 +1,11 @@
 ###############################################################################
-### Analysis of ONE simulated data set
+### Analysis of ONE simulated data set (step by step, same functions as 03)
 ### - Section 0: Settings, data and true values
 ### - Section 1: Data Preparation
 ### - Section 2: Summary Statistics
 ### - Section 3: Estimation of Weights
 ### - Section 4: Fit models (LWYY and Ghosh-Lin)
-### - Section 5: Mean number of falls (nonparametric, weighted)
+### - Section 5: Mean number of falls (nonparametric and model-based)
 ### - Section 6: Collect results
 ###############################################################################
 
@@ -18,22 +18,22 @@ library(mets)        # Ghosh-Lin (recreg)
 library(ipw)         # Inverse Probability Weighting (ipwtm)
 library(splines)     # ns() in the weight models
 
-# functions
-source("functions.R")   
+# functions (the same as in 03_multiple_analyse_cluster.R)
+source("functions.R")
 
-# Constants
-t_end <- 52
 
 #####################################################
 #----------- Section 0: Data and true values -------#
 #####################################################
-current_file <- "./results/Odat_scen48_run0001.rds"
-Odat_all <- readRDS(current_file)
-
-sim_log <- read_csv("./results/00_simulation_log.csv", show_col_types = FALSE)
+sim_log        <- read_csv("./results/00_simulation_log.csv", show_col_types = FALSE)
 true_estimands <- read_csv("./results/00_true_estimands.csv", show_col_types = FALSE)
 
-current_params <- sim_log %>% filter(file_path == current_file)
+# choose the data set by its parameters, not by scenario number (numbers change with the design)
+current_params <- sim_log %>%
+  filter(scenario_name == "2_Informative", effect == "low", drop_beta_arm == -1, mortality_level == "none", sim_run == 1)
+if (nrow(current_params) != 1) stop("data set not found (or not unique) in 00_simulation_log.csv")
+current_file <- current_params$file_path
+Odat_all     <- readRDS(current_file)
 
 # true values per method (one row per causal scenario)
 truth <- true_estimands %>%
@@ -42,6 +42,7 @@ truth <- true_estimands %>%
          True_Beta_Arm == current_params$true_beta_arm[1])
 if (nrow(truth) != 1) stop("true values not found (or not unique) in 00_true_estimands.")
 
+cat("data set:", current_file, "\n")
 cat("conditional DGP parameter (true_beta_arm):", current_params$true_beta_arm[1], "\n")
 cat("True_Beta_LWYY:   ", truth$True_Beta_LWYY, "\n")
 cat("True_Beta_GL:     ", truth$True_Beta_GL, "\n")
@@ -53,13 +54,9 @@ cat("True_LogRateRatio:", truth$True_LogRateRatio, "(ratio of mean falls)\n")
 #####################################################
 # columns from the data generation:
 # observed, n_falls, n_falls_full, drop, death, death_full, cum_falls_lag, train_rate_lag, frailty_t
-Odat_all <- Odat_all %>%
-# log_base_falls = log(1 + falls in the year before)
-# The difference becomes smaller as the number of iterations increases, if the values are too high, recreg does not converge
-  mutate(log_base_falls = log1p(base_risk),                       # log(1 + falls in the year before)
-         tstop         = t,                                     # time variable for the weight models
-         fall_rate_lag  = cum_falls_lag / pmax(t - 1, 1)) %>%    # observed fall rate up to week t-1
-  arrange(ID, t)
+# prep_odat() (functions.R) adds log_base_falls (log(1 + falls in the year before)), tstop (time for the
+# weight models) and log_falls_lag (log(1 + observed falls up to week t-1))
+Odat_all <- prep_odat(Odat_all)
 
 Odat <- Odat_all %>% filter(observed)                            # observed data in the study
 
@@ -109,10 +106,10 @@ Odat_w <- compute_weights(Odat)
 
 
 # check weights for plausibility
-cat("\nStabilised weights (used in models):\n")                
-print(summary(Odat_w[, c("w_sym", "w_symtrain", "w_oracle")]))
+cat("\nStabilised weights (models) and unstabilised weights (MCF):\n")
+print(summary(Odat_w[, c("w_sym", "w_symtrain", "w_oracle", "wm_sym", "wm_symtrain", "wm_oracle")]))
 
-# mean of the stabilised weights per arm and week should be ~1 
+# mean of the stabilised weights per arm and week should be ~1
 weight_check <- Odat_w %>%
   group_by(arm, t) %>%
   summarise(across(c(w_sym, w_symtrain, w_oracle), mean), .groups = "drop") %>%
@@ -129,109 +126,72 @@ cat("\nEffective sample size relative to n person-weeks:\n"); print(ess)
 ###########################################################
 #----------- Section 4: Fit models -----------------------#
 ###########################################################
-
-# counting-process data for LWYY and Ghosh-Lin with prep_counting(): falls of the death / dropout week
-# are kept, weights are carried along per week
-cp      <- prep_counting(Odat_w, "observed")        # observed data incl. weights
-cp_full <- prep_counting(Odat_all, "full")          # complete data (oracle M0)
-
-# --- LWYY (death = censoring) ---------------------------------------------------
-f_lwyy <- Surv(start, stop, status == 1) ~ arm + age + sex + log_base_falls + cluster(ID)
-
-lwyy_full     <- coxph(f_lwyy, data = cp_full, ties = "breslow")
-lwyy_naive    <- coxph(f_lwyy, data = cp,      ties = "breslow")
-lwyy_sym      <- coxph(f_lwyy, data = cp,      ties = "breslow", weights = w_sym)
-lwyy_symtrain <- coxph(f_lwyy, data = cp,      ties = "breslow", weights = w_symtrain)
-lwyy_oracle   <- coxph(f_lwyy, data = cp,      ties = "breslow", weights = w_oracle)
-
-# --- Ghosh-Lin (death = terminal event) -----------------------------------------
-# fitted in all scenarios, without death GL = LWYY
+# fit_models() (functions.R), the same 14 models as in 03:
+# - counting-process data with prep_counting(): falls of the death / dropout week are kept,
+#   weights are carried along per week
+# - LWYY (coxph): death = censoring
+# - Ghosh-Lin (recreg): death = terminal event, without death GL = LWYY
+#   cens.model = ~ strata(arm): censoring Kaplan-Meier per arm (dropout differs between the arms)
+#   control = gl_ctrl (tol 1e-12, Armijo line search): with the default tol 1e-6 recreg stops too early
+# - each model: full data (oracle M0), naive, IPCW sym, sym_train, oracle, sym and sym_train with truncated weights
 # NOTE: whether recreg handles row-specific (time-varying) weights correctly is not yet
 #       verified -> compare with the nonparametric mean number of falls in Section 5
-f_gl <- Event(start, stop, status) ~ arm + age + sex + log_base_falls + cluster(ID)
+fits <- fit_models(Odat_all, Odat_w)
 
-# cens.model = ~ strata(arm):  recreg weights the persons who died with the censoring
-#   probabilities G_c (Kaplan-Meier from the rows with status 0, ?recreg: "Formula for a stratified Cox model
-#   without covariates used to estimate censoring probabilities"). Default ~1 = one Kaplan-Meier for both arms;
-#   dropout differs strongly between the arms -> one Kaplan-Meier per arm, as for the IPCW models (per arm)
-#   and as in the example of ?recreg ("censoring stratified after treatment").
-#   The IPCW weights (weights = ...) are a different correction: informative dropout given the history.
-gl_full     <- recreg(f_gl, data = cp_full, cause = 1, death.code = 3, cens.code = 0, cens.model = ~ strata(arm))
-gl_naive    <- recreg(f_gl, data = cp,      cause = 1, death.code = 3, cens.code = 0, cens.model = ~ strata(arm))
-gl_sym      <- recreg(f_gl, data = cp,      cause = 1, death.code = 3, cens.code = 0, cens.model = ~ strata(arm), weights = cp$w_sym)
-gl_symtrain <- recreg(f_gl, data = cp,      cause = 1, death.code = 3, cens.code = 0, cens.model = ~ strata(arm), weights = cp$w_symtrain)
-gl_oracle   <- recreg(f_gl, data = cp,      cause = 1, death.code = 3, cens.code = 0, cens.model = ~ strata(arm), weights = cp$w_oracle)
+print(summary(fits[["LWYY 3: IPCW sym"]]))             # look at single models if needed
 
 
 
 #############################################################
-#----- Section 5: Mean number of falls (nonparametric) -----#
+#----- Section 5: Mean number of falls ---------------------#
 #############################################################
-# MCF for LWYY
-#   mu_a(52) = sum_t S_a(t-1) * dR_a(t), weighted Nelson-Aalen + weighted Kaplan-Meier per arm
-#   true values: MCF_Control, MCF_Intervention, True_LogRateRatio
-mcf_list <- list(
-  "0: Full data (oracle M0)" = weighted_mcf(Odat_all %>% mutate(w1 = 1), "w1", "n_falls_full", "death_full"),
-  "1: Naive (Unweighted)"    = weighted_mcf(Odat_w %>% mutate(w1 = 1), "w1"),
-  "3: IPCW sym"              = weighted_mcf(Odat_w, "wm_sym"),
-  "4: IPCW sym_train"        = weighted_mcf(Odat_w, "wm_symtrain"),
-  "5: IPCW oracle"           = weighted_mcf(Odat_w, "wm_oracle")
-)
+# mcf_estimate() (functions.R), as in 03:
+# - nonparametric: mu_a(52) = sum_t S_a(t-1) * dR_a(t), weighted Nelson-Aalen + weighted Kaplan-Meier per arm
+#   (weighted_mcf with the unstabilised weights wm_*)
+# - model-based: standardised prediction of every LWYY / GL fit (model_mcf)
+# true values: LWYY -> limit of the LWYY fit on complete data (MCF_LWYY_*, as True_Beta_LWYY),
+#              GL and nonparametric MCF -> real world with death
+mcf_est <- mcf_estimate(Odat_all, Odat_w, fits)
 
-
-# baseline covariates, one row per person (for the standardised model-based MCFs)
-base_cov <- Odat_all %>% filter(t == 1) %>% dplyr::select(ID, age, sex, log_base_falls)
-
-gl_list   <- list("0: Full data (oracle M0)" = gl_full,   "1: Naive (Unweighted)" = gl_naive,
-                  "3: IPCW sym" = gl_sym,   "4: IPCW sym_train" = gl_symtrain,   "5: IPCW oracle" = gl_oracle)
-lwyy_list <- list("0: Full data (oracle M0)" = lwyy_full, "1: Naive (Unweighted)" = lwyy_naive,
-                  "3: IPCW sym" = lwyy_sym, "4: IPCW sym_train" = lwyy_symtrain, "5: IPCW oracle" = lwyy_oracle)
-
-
-# table: nonparametric, GL- and LWYY-based MCF with the matching true values
-# function to compute mcf lwyy and gl see function.R
-mean_falls_table <- bind_rows(
-  imap_dfr(mcf_list, function(m, name)
-    tibble(Model = paste("MCF", name), MCF_Control = m$MCF[m$arm == 0], MCF_Intervention = m$MCF[m$arm == 1])),
-  imap_dfr(gl_list, function(fit, name) {
-    mu <- model_mcf(fit, base_cov, t_end)
-    tibble(Model = paste("MCF-GL", name), MCF_Control = mu[1], MCF_Intervention = mu[2])
-  }),
-  imap_dfr(lwyy_list, function(fit, name) {
-    mu <- model_mcf(fit, base_cov, t_end)
-    tibble(Model = paste("MCF-LWYY", name), MCF_Control = mu[1], MCF_Intervention = mu[2])
-  })
-) %>%
-  mutate(no_death              = startsWith(Model, "MCF-LWYY"),   # LWYY: hypothetical world without death
-         True_MCF_Control      = if_else(no_death, truth$MCF_Control_NoDeath,       truth$MCF_Control),
-         True_MCF_Intervention = if_else(no_death, truth$MCF_Intervention_NoDeath,  truth$MCF_Intervention),
-         True_LogRatio         = if_else(no_death, truth$True_LogRateRatio_NoDeath, truth$True_LogRateRatio),
+mean_falls_table <- tibble(Model            = names(mcf_est),
+                           MCF_Control      = sapply(mcf_est, `[`, 1),
+                           MCF_Intervention = sapply(mcf_est, `[`, 2)) %>%
+  mutate(lwyy                  = startsWith(Model, "MCF-LWYY"),   # LWYY: limit on complete data
+         True_MCF_Control      = if_else(lwyy, truth$MCF_LWYY_Control,      truth$MCF_Control),
+         True_MCF_Intervention = if_else(lwyy, truth$MCF_LWYY_Intervention, truth$MCF_Intervention),
+         True_LogRatio         = if_else(lwyy, truth$True_Beta_LWYY,        truth$True_LogRateRatio),
          Bias_MCF_Control      = MCF_Control - True_MCF_Control,
          Bias_MCF_Intervention = MCF_Intervention - True_MCF_Intervention,
          Log_Ratio             = log(MCF_Intervention / MCF_Control),
          Bias                  = Log_Ratio - True_LogRatio) %>%
-  dplyr::select(-no_death)
+  dplyr::select(-lwyy)
 print(mean_falls_table)
 
+# nonparametric MCF with mets (as in 03): mean falls per arm and robust SE of the log ratio
+# check: MCF_*_mets = weighted_mcf (unweighted identical, weighted ~1e-5 because of tie_offset)
+mcf_mets(Odat_all, Odat_w) %>%
+  left_join(mean_falls_table %>% dplyr::select(Model, MCF_Control, MCF_Intervention), by = "Model") %>%
+  mutate(diff_control      = MCF_Control_mets - MCF_Control,
+         diff_intervention = MCF_Intervention_mets - MCF_Intervention) %>%
+  print()
 
+# time-varying effect: mean falls per quarter (as MCF-Q1..Q4 in 03), here for IPCW sym
+mcf_q_sym <- weighted_mcf(Odat_w, "wm_sym", breaks = c(0, 13, 26, 39, 52)) %>%
+  pivot_wider(names_from = arm, values_from = MCF, names_prefix = "arm") %>%
+  mutate(Log_Ratio     = log(arm1 / arm0),
+         True_LogRatio = unlist(truth[paste0("LogRR_Q", period)]))   # true log ratio per quarter
+print(mcf_q_sym)
 
 
 
 #############################################################
 # ----- Section 6: Collect results -------------------------#
 #############################################################
-comparison_table <- bind_rows(
-  extract_model_results(lwyy_full,     "LWYY 0: Full data (oracle M0)", truth$True_Beta_LWYY),
-  extract_model_results(lwyy_naive,    "LWYY 1: Naive (Unweighted)",    truth$True_Beta_LWYY),
-  extract_model_results(lwyy_sym,      "LWYY 3: IPCW sym",              truth$True_Beta_LWYY),
-  extract_model_results(lwyy_symtrain, "LWYY 4: IPCW sym_train",        truth$True_Beta_LWYY),
-  extract_model_results(lwyy_oracle,   "LWYY 5: IPCW oracle",           truth$True_Beta_LWYY),
-  extract_model_results(gl_full,       "GL 0: Full data (oracle M0)",   truth$True_Beta_GL),
-  extract_model_results(gl_naive,      "GL 1: Naive (Unweighted)",      truth$True_Beta_GL),
-  extract_model_results(gl_sym,        "GL 3: IPCW sym",                truth$True_Beta_GL),
-  extract_model_results(gl_symtrain,   "GL 4: IPCW sym_train",          truth$True_Beta_GL),
-  extract_model_results(gl_oracle,     "GL 5: IPCW oracle",             truth$True_Beta_GL)
-) %>%
+# effect estimates with the true value of each method (as in 03)
+comparison_table <- bind_rows(lapply(names(fits), function(m) {
+  true_beta <- if (startsWith(m, "LWYY")) truth$True_Beta_LWYY else truth$True_Beta_GL
+  extract_model_results(fits[[m]], m, true_beta)
+})) %>%
   mutate(scenario_id = current_params$scenario_id[1],      # for the loop over all files
          sim_run     = current_params$sim_run[1],
          file_path   = current_file)

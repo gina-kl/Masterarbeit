@@ -8,8 +8,18 @@ library(tidyverse)
 library(dplyr)
 library(gt)
 
-sim_log        <- read_csv("./results/00_simulation_log.csv", show_col_types = FALSE)
-true_estimands <- read_csv("./results/00_true_estimands.csv", show_col_types = FALSE)
+# blocks to show: c("main"), c("supp") or c("main", "supp") (as in 05_ergebnisgrafik.R)
+blocks   <- c("main")
+res_dirs <- c(main = "./results_cluster",
+              supp = "./results_cluster/ergebnisse_supp")[blocks]
+out_dir  <- file.path("./05_results", paste(blocks, collapse = "_"))
+dir.create(out_dir, showWarnings = FALSE, recursive = TRUE)
+
+# one file per block, stacked (scenario_id is unique over all blocks)
+sim_log        <- map(file.path(res_dirs, "00_simulation_log.csv"), read_csv, show_col_types = FALSE) %>% list_rbind()
+true_estimands <- map(file.path(res_dirs, "00_true_estimands.csv"), read_csv, show_col_types = FALSE) %>%
+  list_rbind() %>%
+  distinct(Scenario_Name, Mortality, True_Beta_Arm, .keep_all = TRUE)   # same causal scenario in two blocks -> once
 
 
 #####################################################################
@@ -20,9 +30,9 @@ scenario_table <- sim_log %>%
   filter(sim_run == 1) %>%
   dplyr::select(scenario_id, scenario_name, n_pts, true_beta_arm, drop_beta_arm,
          mortality_level, eff_frailty_y, eff_frailty_death,
-         eff_frailty_drop,                                       # NEU 07.10.2026
+         eff_frailty_drop,                                       
          eff_frailty_train,
-         Y_intercept, drop_intercept, death_intercept, train_intercept) %>%       # NEU 07.10.2026: calibrated intercepts
+         Y_intercept, drop_intercept, death_intercept, train_intercept) %>%      
   left_join(
     true_estimands %>%
       dplyr::select(Scenario_Name, Mortality, True_Beta_Arm,
@@ -41,57 +51,60 @@ scenario_table <- sim_log %>%
 print(scenario_table, width = Inf)
 #write_csv(scenario_table, "./results/01_scenario_overview.csv")
 
-# # save as html
-# scenario_gt <- scenario_table %>%
-#   dplyr::select(scenario, scenario_name, death_handling, n_pts, true_beta_arm, drop_beta_arm,
-#                 mortality_level, eff_frailty_y, eff_frailty_cens,
-#                 eff_frailty_drop,                                    
-#                 eff_frailty_train, True_RateRatio, True_LogRateRatio,
-#                 True_LogRateRatio_NoDeath) %>%
-#   gt() %>%
-#   fmt_number(columns = c(true_beta_arm, drop_beta_arm, eff_frailty_y, eff_frailty_cens,
-#                          eff_frailty_drop,
-#                          eff_frailty_train, True_RateRatio, True_LogRateRatio,
-#                          True_LogRateRatio_NoDeath),
-#              decimals = 3) %>%
-#   cols_label(
-#     scenario                  = "Szenario",
-#     scenario_name             = "Name",
-#     death_handling            = "Tod",
-#     n_pts                     = "n",
-#     true_beta_arm             = "β (DGP)",
-#     drop_beta_arm             = "β Drop",
-#     mortality_level           = "Mortalität",
-#     eff_frailty_y             = "Frailty Y",
-#     eff_frailty_cens          = "Frailty Tod",       
-#     eff_frailty_drop          = "Frailty Dropout",   
-#     eff_frailty_train         = "Frailty Train",
-#     True_RateRatio            = "RR",
-#     True_LogRateRatio         = "log RR",
-#     True_LogRateRatio_NoDeath = "log RR (ohne Tod)"
-#   ) %>%
-#   tab_spanner(label = "Frailty-Effekte",
-#               columns = starts_with("eff_frailty")) %>%
-#   tab_spanner(label = "Wahre Schätzgrößen",
-#               columns = c(True_RateRatio, True_LogRateRatio, True_LogRateRatio_NoDeath)) %>%
-#   tab_header(title = "Simulationsszenarien")
-# 
+# save as html
+ scenario_gt <- scenario_table %>%
+   dplyr::select(scenario, scenario_name, death_handling, n_pts, true_beta_arm, drop_beta_arm,
+                 mortality_level, eff_frailty_y, eff_frailty_death,
+                 eff_frailty_drop,
+                 eff_frailty_train, True_RateRatio, True_LogRateRatio,
+                 True_LogRateRatio_NoDeath) %>%
+   gt() %>%
+   fmt_number(columns = c(true_beta_arm, drop_beta_arm, eff_frailty_y, eff_frailty_death,
+                          eff_frailty_drop,
+                          eff_frailty_train, True_RateRatio, True_LogRateRatio,
+                          True_LogRateRatio_NoDeath),
+              decimals = 3) %>%
+   cols_label(
+     scenario                  = "Szenario",
+     scenario_name             = "Name",
+     death_handling            = "Tod",
+     n_pts                     = "n",
+     true_beta_arm             = "β (DGP)",
+     drop_beta_arm             = "β Drop",
+     mortality_level           = "Mortalität",
+     eff_frailty_y             = "Frailty Y",
+     eff_frailty_death          = "Frailty Tod",
+     eff_frailty_drop          = "Frailty Dropout",
+     eff_frailty_train         = "Frailty Train",
+     True_RateRatio            = "RR",
+     True_LogRateRatio         = "log RR",
+     True_LogRateRatio_NoDeath = "log RR (ohne Tod)"
+   ) %>%
+   tab_spanner(label = "Frailty-Effekte",
+               columns = starts_with("eff_frailty")) %>%
+   tab_spanner(label = "Wahre Schätzgrößen",
+               columns = c(True_RateRatio, True_LogRateRatio, True_LogRateRatio_NoDeath)) %>%
+   tab_header(title = "Simulationsszenarien")
 
-#gtsave(scenario_gt, "res_tables/scenario_table.html")
+
+gtsave(scenario_gt, file.path(out_dir, "scenario_table.html"))
 
 
 
 #####################################################################
-#----- Section 2Check of the distributions in one data set ---------#
+#----- Section 2: Check of the distributions in one data set ---------#
 #####################################################################
 
 # needs: Odat_all (weekly data of one simulated study, complete data until death)
 
 library(tidyverse)
 # choose the data set by its parameters, not by scenario number (numbers change with the design)
+# H1 with mortality "high" and effect "high" if they are in the blocks, otherwise main block (no mortality, low effect)
 current_file <- sim_log %>%
-  filter(scenario_name == "2_Informative", true_beta_arm == -0.4, drop_beta_arm == -1,
-         mortality_level == "high", sim_run == 1) %>%
+  filter(scenario_name == "2_Informative", effect != "none", drop_beta_arm == -1, sim_run == 1,
+         file.exists(file_path)) %>%                              # only data sets that are on this computer
+  arrange(desc(mortality_level == "high"), desc(effect == "high")) %>%
+  slice(1) %>%
   pull(file_path)
 if (length(current_file) != 1) stop("data set not found (or not unique) in 00_simulation_log.csv")
 Odat_all <- readRDS(current_file)
@@ -114,6 +127,7 @@ per <- Odat_all %>%
             .groups = "drop") %>%
   mutate(Arm     = factor(arm, 0:1, c("Control", "Training")),
          frail_q = factor(ntile(frailty, 4), 1:4, c("Q1 (least frail)", "Q2", "Q3", "Q4 (most frail)")))
+
 
 #--- Table 1: overview per arm ----------------------------------------------------------
 tab_overview <- per %>%
