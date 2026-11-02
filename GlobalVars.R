@@ -27,13 +27,15 @@ causal_vars <- c("true_beta_arm", "max_frailty_red", "mortality_level", "eff_fra
 #   "main": 6 core scenarios without mortality (2_Informative H0 + low effect, 3 with low effect)
 #   "supp": all other scenarios (1_NoFrailty, 4_ObsDropout, 5_NoIndirect, high effect, mortality "high")
 scenario_blocks <- c("main")                                        # c("main"), c("supp") or c("main", "supp")
-results_subdir  <- paste(sort(unique(scenario_blocks)), collapse = "_")   # cluster: results in <workspace>/results/<results_subdir>
-
+# length of the analysis intervals in weeks: 1 = weekly, 13 = quarterly visits (to_intervals(), functions.R)
+interval_weeks <- 1
+results_subdir <- paste0(paste(sort(unique(scenario_blocks)), collapse = "_"),
+                         if (interval_weeks > 1) paste0("_int", interval_weeks))   # cluster: results in <workspace>/results/<results_subdir>
 
 # target values for intercepts
 target_falls   <- 0.30                                          # percentage of units with at least one fall per year (control arm)
 target_dropout <- 0.20                                          # perc with dropout per year (control arm; training arm: drop_beta_arm and frailty reduction)
-target_death   <- c(none = 0, high = 0.02)                      # mortality per year (none = no death)
+target_death   <- c(none = 0, high = 0.02, very_high = 0.15)    # mortality per year (none = no death)
 target_train   <- 0.63                                          # share of persons training in week 1 (training arm)
 
 # proxy strength

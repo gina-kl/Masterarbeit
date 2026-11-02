@@ -52,7 +52,7 @@ analyse_one_run <- function(file_path, sim_log, true_estimands) {
 
   # -- Data Preparation -------------------------------------------------
 
-  Odat_all <- prep_odat(Odat_all)                                # log_base_falls, tstop, log_falls_lag (functions.R)
+  Odat_all <- prep_odat(Odat_all, interval_weeks)                                # log_base_falls, tstop, log_falls_lag (functions.R)
 
   # synthetic proxy P(t) = FrailtyT(t) + sd * eps (GlobalVars.R: proxy_sd, proxy_seed, proxy_scenarios)
   # one eps per person and week; seed of the complete data + offset -> same noise in all scenarios
@@ -164,7 +164,7 @@ analyse_one_run <- function(file_path, sim_log, true_estimands) {
 
   # nonparametric MCF per quarter of year (for time varying effect)
   # only under H1: with beta = 0 there is no effect that could vary over time (true LogRR_Q* = 0)
-  q_breaks <- c(0, 13, 26, 39, 52)                                 # weeks
+  q_breaks <- c(0, 13, 26, 39, 52) / interval_weeks                                # weeks
   mcf_q <- if (current_params$true_beta_arm[1] != 0) {
     q_list <- list(
       "0: Full data (oracle M0)" = weighted_mcf(Odat_all %>% mutate(w1 = 1), "w1", "n_falls_full", "death_full", breaks = q_breaks),
@@ -232,7 +232,7 @@ dir.create(res_dir, showWarnings = FALSE, recursive = TRUE)
 # functions needed on the workers
 ana_funs <- c("analyse_one_run", "prep_odat", "extract_model_results", "wald_results", "prep_counting", "lag_ipw",
               "weighted_mcf", "compute_weights", "trunc_w", "model_mcf", "fit_models", "mcf_estimate",
-              "mets_mcf", "mcf_mets", "tie_offset")
+              "mets_mcf", "mcf_mets", "tie_offset", "to_intervals")
 
 
 # --- parallalise ----------------------------------------------------------------
@@ -278,7 +278,7 @@ if (run_analyse) {   # cluster ------------- "analyse" -------------------------
     i = seq_len(nrow(sim_log)),
     .combine = bind_rows,
     .packages = c("ipw", "survival", "splines", "mets", "dplyr", "tidyr", "readr"),
-    .export = c(ana_funs, "proxy_sd", "proxy_seed", "proxy_scenarios")
+    .export = c(ana_funs, "proxy_sd", "proxy_seed", "proxy_scenarios", "interval_weeks")
   ) %dopar% {
     # every unexpected error (e.g. readRDS, MCF, extraction) only marks this run as failed,
     # otherwise foreach would stop and all runs of the scenario would be lost

@@ -21,7 +21,9 @@ tie_offset <- function(ID, eps = 0.01) eps * ((ID * 0.6180339887498949) %% 1)
 
 
 # variables for the analysis, computed from the simulated data (same in 02, 03 and the bootstrap)
-prep_odat <- function(dat) {
+# interval_weeks = 1: weekly visits, >1: only all k weeks -> more data lost with dropout
+prep_odat <- function(dat, interval_weeks = 1) {
+  if(interval_weeks>1) dat <- to_intervals(dat, interval_weeks)
   dat %>%
     mutate(log_base_falls = log1p(base_risk),                       # log(1 + falls in the year before)
            tstop          = t,                                      # time variable for the weight models
@@ -77,6 +79,30 @@ prep_counting <- function(dat, data = c("observed", "full")) {
     as.data.frame()
 }
 
+
+# compute data in 3-months intervals (assume fall question sheet only all 3 months and not weekly)
+# falls are only reported if not droped out in the time interval before visit. If droped out in interval, all falls of the interval are lost
+# observed: at the start of the interval
+# drop = 1, no falls are reported, only used for weight model
+# death at the end of interval. If dropout in same interval -> death not obseved
+
+to_intervals <- function(dat, interval_weeks){
+  dat %>%
+    arrange(ID, t) %>%
+    mutate(t = ceiling(t/interval_weeks)) %>%
+    group_by(ID, t) %>%
+    summarise(
+      across(c(arm, age, sex, base_risk, frailty, ever_dropped), first),         # constant per person
+      across(c(frailty_t, cum_falls_lag, cum_train_lag, train_rate_lag), first), # state at the start
+      observed     = any(observed),
+      drop         = max(drop),
+      death        = max(death),
+      death_full   = max(death_full),
+      n_falls_full = sum(n_falls_full),
+      n_falls      = if (drop == 1) NA_real_ else sum(n_falls),   # needs drop from the line above
+      .groups = "drop")
+  
+}
 
 #--------------- Section 2: Models (LWYY, Ghosh-Lin) --------------------------------
 
@@ -169,13 +195,16 @@ fit_models <- function(Odat_all, Odat_w, use_proxy = FALSE){
 
 
 compute_weights <- function(dat, trunc_q = 0.99, use_proxy = FALSE){
+  # observed row without falls = dropout interval without reported falls (to_intervals()):
+  # the weight must include the own interval -> no shift
+  no_shift <- any(dat$observed & is.na(dat$n_falls))
   dat %>%
     mutate(tstart = t - 1) %>%
     split(.$arm) %>%
     lapply(function(d_all){
       d_all <- d_all %>% arrange(ID, t) %>% as.data.frame()
       d_fit <- d_all %>% filter(death == 0)          # weeks in which a dropout is possible
-      shift <- function(fit)lag_ipw(fit, d_fit, d_all) # shift ipcw by one week
+      shift <- function(fit)lag_ipw(fit, d_fit, d_all, shift = !no_shift) # shift ipcw by one week (only for weekly data)
 
       w_sym <- shift(ipwtm(exposure = drop, family = "binomial", link = "logit",
         numerator = ~ age + sex + log_base_falls + ns(tstop, df = 3),
@@ -264,6 +293,7 @@ compute_weights <- function(dat, trunc_q = 0.99, use_proxy = FALSE){
                        wm_sym_tr = trunc_w(wm_sym, trunc_q), wm_symtrain_tr = trunc_w(wm_symtrain, trunc_q))
     }) %>%
     bind_rows() %>%
+    filter(!(no_shift & drop == 1)) %>%   # dropout rows only for the weight models
     arrange(ID, t)
     }
 
@@ -282,16 +312,21 @@ trunc_w <- function(w, q) pmin(w, quantile(w, q, names = FALSE))
 #   ipw_fit: result of ipwtm(..., data = d_fit)
 #   d_fit  : data used in ipwtm (weeks without death, sorted by ID, t)
 #   d_all  : all observed weeks of the same arm (sorted by ID, t) -> weights aligned with d_all
-lag_ipw <- function(ipw_fit, d_fit, d_all) {
-  d_fit %>%
+# shift only for weekly data
+lag_ipw <- function(ipw_fit, d_fit, d_all, shift = TRUE) {
+  w <- d_fit %>%
     dplyr::select(ID, t) %>%
     mutate(w_cum = ipw_fit$ipw.weights) %>%
     right_join(d_all %>% dplyr::select(ID, t), by = c("ID", "t")) %>%
     arrange(ID, t) %>%
-    group_by(ID) %>%
-    mutate(w = lag(w_cum, default = 1)) %>%   # shift by one entry
-    ungroup() %>%
-    pull(w)
+    group_by(ID) 
+  if (shift) {
+    w <- w %>% mutate(w = lag(w_cum, default = 1))     # weekly: falls of week t are seen before a dropout at its end
+  } else {
+    w <- w %>% tidyr::fill(w_cum) %>%                  # intervals: weight includes the own interval, death rows get the weight before
+      mutate(w = tidyr::replace_na(w_cum, 1))
+  }
+  w %>% ungroup() %>% pull(w)
 }
 
 
@@ -370,7 +405,7 @@ mcf_estimate <- function(Odat_all, Odat_w, fits = NULL, use_proxy = FALSE){
   base_cov <- Odat_all %>% filter(t == 1) %>% dplyr::select(ID, age, sex, log_base_falls)   # one row per person
   c(
     lapply(mcf_list, function(mm) c(mm$MCF[mm$arm == 0], mm$MCF[mm$arm == 1])),
-    if (!is.null(fits)) setNames(lapply(fits, function(f) tryCatch(model_mcf(f, base_cov), error = function(e) c(NA, NA))),
+    if (!is.null(fits)) setNames(lapply(fits, function(f) tryCatch(model_mcf(f, base_cov, t.end = max(Odat_all$t)), error = function(e) c(NA, NA))),
                                  paste0("MCF-", names(fits)))                                  # "MCF-LWYY ..." / "MCF-GL ..."
   )
 }
@@ -382,7 +417,7 @@ mcf_estimate <- function(Odat_all, Odat_w, fits = NULL, use_proxy = FALSE){
 # weights are treated as known (as for the robust SE of the weighted LWYY / GL models)
 # cp: counting process data from prep_counting(), w: weight column (NULL = unweighted)
 # status 1 = fall (cause), 3 = death (terminal event), strata(arm) -> one estimate per arm
-mets_mcf <- function(cp, w = NULL, t.end = 52) {
+mets_mcf <- function(cp, w = NULL, t.end = floor(max(cp$stop))) {
   wt  <- if (is.null(w)) rep(1, nrow(cp)) else cp[[w]]  # 1= unweighted
   fit <- recurrent_marginal(Event(start, stop, status) ~ strata(arm) + cluster(ID), data = cp,
                             cause = 1, death.code = 3, weights = wt)

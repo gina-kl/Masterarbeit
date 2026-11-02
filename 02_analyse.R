@@ -20,7 +20,7 @@ library(splines)     # ns() in the weight models
 
 # functions (the same as in 03_multiple_analyse_cluster.R)
 source("functions.R")
-
+source("GlobalVars.R")
 
 #####################################################
 #----------- Section 0: Data and true values -------#
@@ -56,7 +56,7 @@ cat("True_LogRateRatio:", truth$True_LogRateRatio, "(ratio of mean falls)\n")
 # observed, n_falls, n_falls_full, drop, death, death_full, cum_falls_lag, train_rate_lag, frailty_t
 # prep_odat() (functions.R) adds log_base_falls (log(1 + falls in the year before)), tstop (time for the
 # weight models) and log_falls_lag (log(1 + observed falls up to week t-1))
-Odat_all <- prep_odat(Odat_all)
+Odat_all <- prep_odat(Odat_all, interval_weeks)
 
 Odat <- Odat_all %>% filter(observed)                            # observed data in the study
 
@@ -176,7 +176,7 @@ mcf_mets(Odat_all, Odat_w) %>%
   print()
 
 # time-varying effect: mean falls per quarter (as MCF-Q1..Q4 in 03), here for IPCW sym
-mcf_q_sym <- weighted_mcf(Odat_w, "wm_sym", breaks = c(0, 13, 26, 39, 52)) %>%
+mcf_q_sym <- weighted_mcf(Odat_w, "wm_sym", breaks = c(0, 13, 26, 39, 52) / interval_weeks) %>%
   pivot_wider(names_from = arm, values_from = MCF, names_prefix = "arm") %>%
   mutate(Log_Ratio     = log(arm1 / arm0),
          True_LogRatio = unlist(truth[paste0("LogRR_Q", period)]))   # true log ratio per quarter

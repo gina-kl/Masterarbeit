@@ -48,12 +48,22 @@ scenario_grid <- expand_grid(
   mutate(train_frailty_eff = ifelse(effect == "none", 0, train_frailty_eff),   # strict H0: no effect via training either
          scenario_id = row_number())
 
+# add very high mortality for main scenarios. Is appended at the end (scenarios ids are not changed)
+mort_rows <- scenario_grid %>%
+  filter(mortality_level == "none" &    # each combination only once
+           ((scenario_name == "2_Informative" & effect %in% c("none", "low")) |
+              (scenario_name == "4_ObsDropout" & effect == "low"))) %>%
+  mutate(mortality_level = "very_high", scenario_id = max(scenario_grid$scenario_id) + row_number()) # add at the end with new scenario ids
+
+scenario_grid <- bind_rows(scenario_grid, mort_rows)
+
 # causal scenario: same causal parameters -> same complete data (same seed) and same truth
 # numbering in order of first appearance on the complete grid
 causal_ids <- scenario_grid %>%
   distinct(across(all_of(causal_vars))) %>%
   mutate(causal_id = row_number())
 scenario_grid <- scenario_grid %>% left_join(causal_ids, by = causal_vars)
+
 
 # blocks
 #   main: core question, no mortality: 2_Informative x {H0, low} x drop_beta_arm,
@@ -65,6 +75,9 @@ scenario_grid <- scenario_grid %>%
                           ((scenario_name == "2_Informative" & effect %in% c("none", "low")) |
                              (scenario_name == "4_ObsDropout" & effect == "low")),
                         "main", "supp"))
+scenario_grid <- scenario_grid %>%
+  mutate(block = ifelse(mortality_level == "very_high", "mort", block))
 
-base_scenarios <- scenario_grid %>% filter(block %in% scenario_blocks) # scenario_blocks = main oder supp
+
+base_scenarios <- scenario_grid %>% filter(block %in% scenario_blocks) # scenario_blocks = main /supp/mort
 if (nrow(base_scenarios) == 0) stop("no scenarios in block(s) ", paste(scenario_blocks, collapse = ", "))
