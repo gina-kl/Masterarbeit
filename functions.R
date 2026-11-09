@@ -80,29 +80,46 @@ prep_counting <- function(dat, data = c("observed", "full")) {
 }
 
 
-# compute data in 3-months intervals (assume fall question sheet only all 3 months and not weekly)
-# falls are only reported if not droped out in the time interval before visit. If droped out in interval, all falls of the interval are lost
-# observed: at the start of the interval
-# drop = 1, no falls are reported, only used for weight model
-# death at the end of interval. If dropout in same interval -> death not obseved
 
-to_intervals <- function(dat, interval_weeks){
+# visits every interval_weeks weeks instead of weekly reports (SURE-FIT: questionnaire every 3 months on the
+# falls of the preceding 3 months). interval_weeks must divide 52. Convention (as in the weekly data,
+# a dropout at the end of week w means that week w is still observed):
+#   - the visit at the end of interval k takes place if the person is in the study until its last week
+#     (dropout week >= k * interval_weeks) -> the falls of interval k are reported
+#   - dropout before the visit week of interval k -> no falls of interval k (drop = 1, row only for the weight models)
+#   - dropout in the visit week -> interval k is reported, the next interval is the dropout interval
+#   - dropout in week 52 -> last questionnaire returned = completer (ever_dropped = 0)
+#   - death in an interval: the falls until the death are reported (death = 1);
+to_intervals <- function(dat, interval_weeks) {
+  if (52 %% interval_weeks != 0) stop("interval_weeks must divide 52")
   dat %>%
     arrange(ID, t) %>%
-    mutate(t = ceiling(t/interval_weeks)) %>%
-    group_by(ID, t) %>%
+    group_by(ID) %>%
+    mutate(drop_week = if (any(drop == 1)) t[drop == 1][1] else NA_real_) %>%      # dropout at the end of this week
+    ungroup() %>%
+    mutate(week   = t,                                                             # week number
+           t      = ceiling(week / interval_weeks),                                # number of the interval
+           wk_in  = week - (t - 1) * interval_weeks,                               # week within the interval
+           k_rep  = ifelse(is.na(drop_week), Inf, floor(drop_week / interval_weeks)),   # last reported interval
+           obs_k  = t <= k_rep + 1,                                                # in the study at the start of the interval (all reported intervals and the one after)
+           drop_k = as.integer(t == k_rep + 1)) %>%                                # dropout interval
+    group_by(ID, t) %>%                                                            # group by ID and interval
     summarise(
-      across(c(arm, age, sex, base_risk, frailty, ever_dropped), first),         # constant per person
-      across(c(frailty_t, cum_falls_lag, cum_train_lag, train_rate_lag), first), # state at the start
-      observed     = any(observed),
-      drop         = max(drop),
+      across(c(arm, age, sex, base_risk, frailty), first),                         # constant per person
+      across(c(frailty_t, cum_falls_lag, cum_train_lag, train_rate_lag), first),   # state at the start
+      observed     = first(obs_k),
+      drop         = first(drop_k),
       death        = max(death),
       death_full   = max(death_full),
       n_falls_full = sum(n_falls_full),
-      n_falls      = if (drop == 1) NA_real_ else sum(n_falls),   # needs drop from the line above
-      .groups = "drop")
-  
+      n_falls      = if (drop == 1) NA_real_ else sum(n_falls),                    # needs drop from above
+      .groups = "drop") %>%
+    group_by(ID) %>%
+    mutate(ever_dropped = as.integer(any(drop == 1))) %>%                          # week-52 dropouts are completers
+    ungroup()
 }
+
+
 
 #--------------- Section 2: Models (LWYY, Ghosh-Lin) --------------------------------
 
@@ -127,9 +144,16 @@ wald_results <- function(model_name, est, se, true_beta) {
 # extract result out of cox model (LWYY) or recreg model (Ghosh-Lin)
 # true_beta: the true value that belongs to this method (True_Beta_LWYY or True_Beta_GL)
 extract_model_results <- function(model, model_name, true_beta) {
-  est <- unname(coef(model)["arm"])
-  se  <- sqrt(vcov(model)["arm", "arm"])         # robust (cluster) SE
-  wald_results(model_name, est, se, true_beta)
+  warn <- attr(model, "warn")                    # warnings of the fit (safe_fit in fit_models)
+  res <- if (is.logical(model)) {
+    wald_results(model_name, NA_real_, NA_real_, true_beta)   # failed model
+  } else {
+    est <- unname(coef(model)["arm"])
+    se  <- sqrt(vcov(model)["arm", "arm"])       # robust (cluster) SE
+    wald_results(model_name, est, se, true_beta)
+  }
+  res %>% mutate(n_warn   = length(warn),
+                 warn_msg = if (length(warn) > 0) paste(unique(warn), collapse = "; ") else NA_character_)
 }
 
 # fit models
@@ -151,35 +175,51 @@ fit_models <- function(Odat_all, Odat_w, use_proxy = FALSE){
     # objective enough -> same solution, normal fits unchanged
     gl_ctrl <- list(tol = 1e-12, backtrack = "armijo")
 
+    # failed model -> NA, the other models of the run are kept (reported as n_est in the aggregation of 03)
+    # warnings (e.g. no convergence) are saved with the fit, the model itself is kept
+    safe_fit <- function(expr) {
+      warn <- character()
+      fit <- tryCatch(
+        withCallingHandlers(expr, warning = function(w) {
+          warn <<- c(warn, conditionMessage(w))
+          invokeRestart("muffleWarning")
+        }),
+        error = function(e) NA)
+      attr(fit, "warn") <- warn
+      fit
+    }
+
     # GL: cens.model = ~ strata(arm) -> internal censoring Kaplan-Meier per arm
     # 6 / 7: truncated weights (sensitivity analysis, see compute_weights())
     fits <- list(
-      "LWYY 0: Full data (oracle M0)" = coxph(f_lwyy, data = cp_full, ties = "breslow"),
-      "LWYY 1: Naive (Unweighted)"    = coxph(f_lwyy, data = cp, ties = "breslow"),
-      "LWYY 3: IPCW sym"              = coxph(f_lwyy, data = cp, ties = "breslow", weights = cp$w_sym),
-      "LWYY 4: IPCW sym_train"        = coxph(f_lwyy, data = cp, ties = "breslow", weights = cp$w_symtrain),
-      "LWYY 5: IPCW oracle"           = coxph(f_lwyy, data = cp, ties = "breslow", weights = cp$w_oracle),
-      "LWYY 6: IPCW sym trunc"        = coxph(f_lwyy, data = cp, ties = "breslow", weights = cp$w_sym_tr),
-      "LWYY 7: IPCW sym_train trunc"  = coxph(f_lwyy, data = cp, ties = "breslow", weights = cp$w_symtrain_tr),
-      "GL 0: Full data (oracle M0)"   = recreg(f_gl, data = cp_full, cause = 1, death.code = 3, cens.code = 0, cens.model = ~ strata(arm), control = gl_ctrl),
-      "GL 1: Naive (Unweighted)"      = recreg(f_gl, data = cp, cause = 1, death.code = 3, cens.code = 0, cens.model = ~ strata(arm), control = gl_ctrl),
-      "GL 3: IPCW sym"                = recreg(f_gl, data = cp, cause = 1, death.code = 3, cens.code = 0, cens.model = ~ strata(arm),
-                                               weights = cp$w_sym, control = gl_ctrl),
-      "GL 4: IPCW sym_train"          = recreg(f_gl, data = cp, cause = 1, death.code = 3, cens.code = 0, cens.model = ~ strata(arm),
-                                               weights = cp$w_symtrain, control = gl_ctrl),
-      "GL 5: IPCW oracle"             = recreg(f_gl, data = cp, cause = 1, death.code = 3, cens.code = 0, cens.model = ~ strata(arm),
-                                               weights = cp$w_oracle, control = gl_ctrl),
-      "GL 6: IPCW sym trunc"          = recreg(f_gl, data = cp, cause = 1, death.code = 3, cens.code = 0, cens.model = ~ strata(arm),
-                                               weights = cp$w_sym_tr, control = gl_ctrl),
-      "GL 7: IPCW sym_train trunc"    = recreg(f_gl, data = cp, cause = 1, death.code = 3, cens.code = 0, cens.model = ~ strata(arm),
-                                               weights = cp$w_symtrain_tr, control = gl_ctrl)
+      "LWYY 0: Full data (oracle M0)" = safe_fit(coxph(f_lwyy, data = cp_full, ties = "breslow")),
+      "LWYY 1: Naive (Unweighted)"    = safe_fit(coxph(f_lwyy, data = cp, ties = "breslow")),
+      "LWYY 3: IPCW sym"              = safe_fit(coxph(f_lwyy, data = cp, ties = "breslow", weights = cp$w_sym)),
+      "LWYY 4: IPCW sym_train"        = safe_fit(coxph(f_lwyy, data = cp, ties = "breslow", weights = cp$w_symtrain)),
+      "LWYY 5: IPCW oracle"           = safe_fit(coxph(f_lwyy, data = cp, ties = "breslow", weights = cp$w_oracle)),
+      "LWYY 6: IPCW sym trunc"        = safe_fit(coxph(f_lwyy, data = cp, ties = "breslow", weights = cp$w_sym_tr)),
+      "LWYY 7: IPCW sym_train trunc"  = safe_fit(coxph(f_lwyy, data = cp, ties = "breslow", weights = cp$w_symtrain_tr)),
+      "GL 0: Full data (oracle M0)"   = safe_fit(recreg(f_gl, data = cp_full, cause = 1, death.code = 3, cens.code = 0, cens.model = ~ strata(arm), control = gl_ctrl)),
+      "GL 1: Naive (Unweighted)"      = safe_fit(recreg(f_gl, data = cp, cause = 1, death.code = 3, cens.code = 0, cens.model = ~ strata(arm), control = gl_ctrl)),
+      "GL 3: IPCW sym"                = safe_fit(recreg(f_gl, data = cp, cause = 1, death.code = 3, cens.code = 0, cens.model = ~ strata(arm),
+                                                        weights = cp$w_sym, control = gl_ctrl)),
+      "GL 4: IPCW sym_train"          = safe_fit(recreg(f_gl, data = cp, cause = 1, death.code = 3, cens.code = 0, cens.model = ~ strata(arm),
+                                                        weights = cp$w_symtrain, control = gl_ctrl)),
+      "GL 5: IPCW oracle"             = safe_fit(recreg(f_gl, data = cp, cause = 1, death.code = 3, cens.code = 0, cens.model = ~ strata(arm),
+                                                        weights = cp$w_oracle, control = gl_ctrl)),
+      "GL 6: IPCW sym trunc"          = safe_fit(recreg(f_gl, data = cp, cause = 1, death.code = 3, cens.code = 0, cens.model = ~ strata(arm),
+                                                        weights = cp$w_sym_tr, control = gl_ctrl)),
+      "GL 7: IPCW sym_train trunc"    = safe_fit(recreg(f_gl, data = cp, cause = 1, death.code = 3, cens.code = 0, cens.model = ~ strata(arm),
+                                                        weights = cp$w_symtrain_tr, control = gl_ctrl))
     )
-    
-    # 8 / 9 / 10: proxy variants sym + P (only if use_proxy = only without mortality), LWYY only (GL = LWYY without mortality)
+
+    # 8 - 12: proxy variants sym + P (only if use_proxy = only without mortality), LWYY only (GL = LWYY without mortality)
     if (use_proxy) {
-      fits[["LWYY 8: IPCW sym+P sd=2"]]    <- coxph(f_lwyy, data = cp, ties = "breslow", weights = cp$w_P_p2)
-      fits[["LWYY 9: IPCW sym+P sd=1"]]    <- coxph(f_lwyy, data = cp, ties = "breslow", weights = cp$w_P_p1)
-      fits[["LWYY 10: IPCW sym+P sd=0.5"]] <- coxph(f_lwyy, data = cp, ties = "breslow", weights = cp$w_P_p05)
+      fits[["LWYY 8: IPCW sym+P sd=4"]] <- safe_fit(coxph(f_lwyy, data = cp, ties = "breslow", weights = cp$w_P_p4))
+      fits[["LWYY 9: IPCW sym+P sd=2"]]    <- safe_fit(coxph(f_lwyy, data = cp, ties = "breslow", weights = cp$w_P_p2))
+      fits[["LWYY 10: IPCW sym+P sd=1"]]    <- safe_fit(coxph(f_lwyy, data = cp, ties = "breslow", weights = cp$w_P_p1))
+      fits[["LWYY 11: IPCW sym+P sd=0.5"]] <- safe_fit(coxph(f_lwyy, data = cp, ties = "breslow", weights = cp$w_P_p05))
+      fits[["LWYY 12: IPCW sym+P sd=0.25"]]    <- safe_fit(coxph(f_lwyy, data = cp, ties = "breslow", weights = cp$w_P_p025))
     }
     fits
 }
@@ -194,17 +234,21 @@ fit_models <- function(Odat_all, Odat_w, use_proxy = FALSE){
 # dat: observed weekly data (observed == TRUE) with tstop, log_base_falls, log_falls_lag, train_rate_lag, frailty_t
 
 
-compute_weights <- function(dat, trunc_q = 0.99, use_proxy = FALSE){
-  # observed row without falls = dropout interval without reported falls (to_intervals()):
-  # the weight must include the own interval -> no shift
-  no_shift <- any(dat$observed & is.na(dat$n_falls))
+compute_weights <- function(dat, interval_weeks, trunc_q = 0.99, use_proxy = FALSE, t.end = 52){
+  # weekly data (interval_weeks = 1): falls of week t are seen before a dropout at its end -> weights shifted by one week
+  # interval data (> 1, to_intervals()): falls are only reported if there is no dropout before the visit
+  #   -> weight includes the own interval, dropout intervals (no reported falls) only for the weight models
+  # ns(tstop, df = 3): weekly a smooth time trend, with 4 quarterly intervals = factor(tstop)
+  if (max(dat$t) != t.end / interval_weeks)
+    stop("compute_weights: interval_weeks = ", interval_weeks, " does not fit the data (largest t = ", max(dat$t), ")")
+  shift_w <- interval_weeks == 1
   dat %>%
     mutate(tstart = t - 1) %>%
     split(.$arm) %>%
     lapply(function(d_all){
       d_all <- d_all %>% arrange(ID, t) %>% as.data.frame()
-      d_fit <- d_all %>% filter(death == 0)          # weeks in which a dropout is possible
-      shift <- function(fit)lag_ipw(fit, d_fit, d_all, shift = !no_shift) # shift ipcw by one week (only for weekly data)
+      d_fit <- d_all %>% filter(death == 0)                        # rows in which a dropout is possible
+      shift <- function(fit) lag_ipw(fit, d_fit, d_all, shift = shift_w) # shift ipcw by one week (only for weekly data)
 
       w_sym <- shift(ipwtm(exposure = drop, family = "binomial", link = "logit",
         numerator = ~ age + sex + log_base_falls + ns(tstop, df = 3),
@@ -253,7 +297,7 @@ compute_weights <- function(dat, trunc_q = 0.99, use_proxy = FALSE){
         w_symtrain  <- w_sym
         wm_symtrain <- wm_sym
       }
-      # proxy variants sym + P (columns P_p2, P_p1, P_p05 are created in analyse_one_run(), 03)
+      # proxy variants sym + P (columns P_p2, P_p1, P_p05, P_p025, P_p4 are created in analyse_one_run(), 03)
       # formulas written out: ipwtm reads them from its call
       if (use_proxy) {
         d_all$w_P_p2 <- shift(ipwtm(exposure = drop, family = "binomial", link = "logit",
@@ -282,6 +326,22 @@ compute_weights <- function(dat, trunc_q = 0.99, use_proxy = FALSE){
                                       numerator   = ~ ns(tstop, df = 3),
                                       denominator = ~ age + sex + log_base_falls + ns(tstop, df = 3) + log_falls_lag + P_p05,
                                       id = ID, tstart = tstart, timevar = tstop, type = "cens", data = d_fit))
+        d_all$w_P_p025 <- shift(ipwtm(exposure = drop, family = "binomial", link = "logit",
+                                     numerator   = ~ age + sex + log_base_falls + ns(tstop, df = 3),
+                                     denominator = ~ age + sex + log_base_falls + ns(tstop, df = 3) + log_falls_lag + P_p025,
+                                     id = ID, tstart = tstart, timevar = tstop, type = "cens", data = d_fit))
+        d_all$wm_P_p025 <- shift(ipwtm(exposure = drop, family = "binomial", link = "logit",
+                                      numerator   = ~ ns(tstop, df = 3),
+                                      denominator = ~ age + sex + log_base_falls + ns(tstop, df = 3) + log_falls_lag + P_p025,
+                                      id = ID, tstart = tstart, timevar = tstop, type = "cens", data = d_fit))
+        d_all$w_P_p4 <- shift(ipwtm(exposure = drop, family = "binomial", link = "logit",
+                                     numerator   = ~ age + sex + log_base_falls + ns(tstop, df = 3),
+                                     denominator = ~ age + sex + log_base_falls + ns(tstop, df = 3) + log_falls_lag + P_p4,
+                                     id = ID, tstart = tstart, timevar = tstop, type = "cens", data = d_fit))
+        d_all$wm_P_p4 <- shift(ipwtm(exposure = drop, family = "binomial", link = "logit",
+                                      numerator   = ~ ns(tstop, df = 3),
+                                      denominator = ~ age + sex + log_base_falls + ns(tstop, df = 3) + log_falls_lag + P_p4,
+                                      id = ID, tstart = tstart, timevar = tstop, type = "cens", data = d_fit))
         
         
         
@@ -293,7 +353,7 @@ compute_weights <- function(dat, trunc_q = 0.99, use_proxy = FALSE){
                        wm_sym_tr = trunc_w(wm_sym, trunc_q), wm_symtrain_tr = trunc_w(wm_symtrain, trunc_q))
     }) %>%
     bind_rows() %>%
-    filter(!(no_shift & drop == 1)) %>%   # dropout rows only for the weight models
+    filter(shift_w | drop == 0) %>%   # intervals: dropout rows only for the weight models
     arrange(ID, t)
     }
 
@@ -398,9 +458,11 @@ mcf_estimate <- function(Odat_all, Odat_w, fits = NULL, use_proxy = FALSE){
     "MCF 7: IPCW sym_train trunc"  = weighted_mcf(Odat_w, "wm_symtrain_tr")
   )
   if (use_proxy) {
-    mcf_list[["MCF 8: IPCW sym+P sd=2"]]    <- weighted_mcf(Odat_w, "wm_P_p2")
-    mcf_list[["MCF 9: IPCW sym+P sd=1"]]    <- weighted_mcf(Odat_w, "wm_P_p1")
-    mcf_list[["MCF 10: IPCW sym+P sd=0.5"]] <- weighted_mcf(Odat_w, "wm_P_p05")
+    mcf_list[["MCF 8: IPCW sym+P sd=4"]]    <- weighted_mcf(Odat_w, "wm_P_p4")
+    mcf_list[["MCF 9: IPCW sym+P sd=2"]]    <- weighted_mcf(Odat_w, "wm_P_p2")
+    mcf_list[["MCF 10: IPCW sym+P sd=1"]]    <- weighted_mcf(Odat_w, "wm_P_p1")
+    mcf_list[["MCF 11: IPCW sym+P sd=0.5"]] <- weighted_mcf(Odat_w, "wm_P_p05")
+    mcf_list[["MCF 12: IPCW sym+P sd=0.25"]] <- weighted_mcf(Odat_w, "wm_P_p025")
   }
   base_cov <- Odat_all %>% filter(t == 1) %>% dplyr::select(ID, age, sex, log_base_falls)   # one row per person
   c(
@@ -441,9 +503,11 @@ mcf_mets <- function(Odat_all, Odat_w, use_proxy = FALSE) {
     "MCF 7: IPCW sym_train trunc"  = mets_mcf(cp, "wm_symtrain_tr")
   )
   if (use_proxy) {   # same names as in mcf_estimate() (joined by Model in 03)
-    m[["MCF 8: IPCW sym+P sd=2"]]    <- mets_mcf(cp, "wm_P_p2")
-    m[["MCF 9: IPCW sym+P sd=1"]]    <- mets_mcf(cp, "wm_P_p1")
-    m[["MCF 10: IPCW sym+P sd=0.5"]] <- mets_mcf(cp, "wm_P_p05")
+    m[["MCF 8: IPCW sym+P sd=4"]]    <- mets_mcf(cp, "wm_P_p4")
+    m[["MCF 9: IPCW sym+P sd=2"]]    <- mets_mcf(cp, "wm_P_p2")
+    m[["MCF 10: IPCW sym+P sd=1"]]    <- mets_mcf(cp, "wm_P_p1")
+    m[["MCF 11: IPCW sym+P sd=0.5"]] <- mets_mcf(cp, "wm_P_p05")
+    m[["MCF 12: IPCW sym+P sd=0.25"]] <- mets_mcf(cp, "wm_P_p025")
   }
   tibble(Model                 = names(m),
          MCF_Control_mets      = sapply(m, `[[`, "mu_0"),
@@ -472,8 +536,8 @@ boot_sample <- function(dat){
 
 # estimates of one bootstrap sample: weights are estimated again, then only the nonparametric MCF
 # (LWYY / GL have a robust SE) -> log ratio per version
-boot_estimate_mcf <- function(Odat_all) {
-  Odat_w <- compute_weights(Odat_all %>% filter(observed))
+boot_estimate_mcf <- function(Odat_all, interval_weeks) {
+  Odat_w <- compute_weights(Odat_all %>% filter(observed), interval_weeks)
   mcf    <- mcf_estimate(Odat_all, Odat_w)                   # without fits -> only nonparametric rows
   sapply(mcf, function(mu) log(mu[2] / mu[1]))
 }
@@ -501,4 +565,39 @@ save_rds_atomic <- function(object, file) {
   if (!file.rename(tmp, file)) stop("could not rename ", tmp, " to ", file)
   invisible(file)
 }
+
+#----------- Section 7: Random number streams (L'Ecuyer-CMRG) ------------------------
+# Morris et al. (2019): set the seed once and use separate streams for repetitions that run in parallel.
+# One seed for the whole study (master_seed, GlobalVars.R). Every task gets its own stream of the
+# L'Ecuyer-CMRG generator:
+#   data set (causal_id, sim_run)  -> stream data_stream_id(), substreams of this stream:
+#                                     0 = complete data (sim_dag), 1 = dropout uniforms (add_dropout),
+#                                     2 = proxy noise (03), 2 + b = bootstrap sample b (06)
+#   true values (causal_id, block) -> stream true_stream_id(); both arms and the run without death
+#                                     start at the same state (common random numbers)
+# The stream depends only on the ids, not on the worker, the number of cores or the array task.
+# The state is fully determined by master_seed and stream_id (stream_id is saved in the log of 01).
+# The calibration (calibrate_scenarios, calib_drop_fall) keeps its fixed set.seed(): fixed reference
+# populations, not repetitions.
+
+# ids: data streams 1 ... 1e5 - 1, true value streams from 1e5 on (limits checked in 01_generate)
+data_stream_id <- function(causal_id, sim_run) (causal_id - 1) * 1000 + sim_run       # sim_run <= 1000
+true_stream_id <- function(causal_id, block)   1e5 + (causal_id - 1) * 1000 + block   # block <= 1000
+
+# k-th substream of the stream with state s (k = 0: s itself)
+sub_stream <- function(s, k) {
+  for (j in seq_len(k)) s <- parallel::nextRNGSubStream(s)
+  s
+}
+
+# state (.Random.seed) at the start of stream stream_id (and of its substream)
+rng_stream <- function(stream_id, substream = 0, seed = master_seed) {
+  set.seed(seed, kind = "L'Ecuyer-CMRG")
+  s <- get(".Random.seed", envir = .GlobalEnv)
+  for (j in seq_len(stream_id)) s <- parallel::nextRNGStream(s)
+  sub_stream(s, substream)
+}
+
+# continue drawing random numbers from state s (also switches the generator to L'Ecuyer-CMRG)
+use_stream <- function(s) assign(".Random.seed", s, envir = .GlobalEnv)
 

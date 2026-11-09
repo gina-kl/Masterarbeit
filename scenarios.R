@@ -11,23 +11,23 @@
 #  - 1_NoFrailty: frailty without any effect (proportional rates, non-informative dropout)
 #  - 2_Informative: frailty -> falls, death, dropout, training; training -> frailty
 #  - 3_NoInfDropout: as 2, but dropout does not depend on frailty
-#  - 4_ObsDropout: as 2, but dropout depends only on the observed falls up to t-1, log(1 + falls) (log_falls_lag),
+#  - 4_ObsDropout: as 2, but dropout depends only on the observed falls up to t-1,
 #                  MAR given the observed history -> IPCW sym is correctly specified (positive control)
 #  - 5_NoIndirect: as 2, but training does not reduce frailty (no indirect effect via frailty)
 
 scenarios_def <- tribble(
   ~scenario_name,    ~eff_frailty_y, ~eff_frailty_death, ~eff_frailty_drop, ~eff_fall_drop, ~eff_frailty_train, ~train_frailty_eff,
   "1_NoFrailty",     0.0,            0.0,               0.0,               0.0,            0.0,                0.0,
-  "2_Informative",   1.2,            1.2,               0.8,               0.0,           -1.5,                0.02,
-  "3_NoInfDropout",  1.2,            1.2,               0.0,               0.0,           -1.5,                0.02,
-  "4_ObsDropout",    1.2,            1.2,               0.0,               1.5,           -1.5,                0.02,   
-  "5_NoIndirect",    1.2,            1.2,               0.8,               0.0,           -1.5,                0.0
+  "2_Informative",   1.2,            0.6,               0.8,               0.0,           -1.0,                0.02,
+  "3_NoInfDropout",  1.2,            0.6,               0.0,               0.0,           -1.0,                0.02,
+  "4_ObsDropout",    1.2,            0.6,               0.0,               1.5,           -1.0,                0.02,
+  "5_NoIndirect",    1.2,            0.6,               0.8,               0.0,           -1.0,                0.0
 )
 
 # treatment effect: direct effect (true_beta_arm) and maximal frailty reduction by training (max_frailty_red)
 # none: H0 (no direct effect, training does not change frailty either)
-# low:  realistic, marginal log RR about -0.26 in 2_Informative
-# high: former effect, marginal log RR about -0.58 in 2_Informative
+# low:  realistic, marginal log RR about -0.29 in 2_Informative, at least one fall: 35 % -> about 28 % (SURE-FIT protocol: 35 % -> 28 %)
+# high: former effect, stronger than in exercise trials
 effect_def <- tribble(
   ~effect, ~true_beta_arm, ~max_frailty_red, 
   "none",  0.0,            0.0,
@@ -57,6 +57,22 @@ mort_rows <- scenario_grid %>%
 
 scenario_grid <- bind_rows(scenario_grid, mort_rows)
 
+# sensitivity analyses, only beta_C = -1 (with beta_C = 0 the naive log ratio is almost unbiased)
+#  - 2_Informative_Y08: weaker effect of frailty on falls (H0 and low effect)
+#  - 2_Informative_Tr0: training does not depend on frailty, train_rate_lag is no proxy (low effect)
+# own names: the true values are matched by scenario name, mortality and beta
+# appended at the end (scenario ids and streams are not changed)
+sens_base <- scenario_grid %>%
+  filter(scenario_name == "2_Informative", mortality_level == "none", drop_beta_arm == -1)
+sens_rows <- bind_rows(
+  sens_base %>% filter(effect %in% c("none", "low")) %>%
+    mutate(scenario_name = "2_Informative_Y08", eff_frailty_y = 0.8),
+  sens_base %>% filter(effect == "low") %>%
+    mutate(scenario_name = "2_Informative_Tr0", eff_frailty_train = 0)) %>%
+  mutate(scenario_id = max(scenario_grid$scenario_id) + row_number())
+
+scenario_grid <- bind_rows(scenario_grid, sens_rows)
+
 # causal scenario: same causal parameters -> same complete data (same seed) and same truth
 # numbering in order of first appearance on the complete grid
 causal_ids <- scenario_grid %>%
@@ -76,8 +92,9 @@ scenario_grid <- scenario_grid %>%
                              (scenario_name == "4_ObsDropout" & effect == "low")),
                         "main", "supp"))
 scenario_grid <- scenario_grid %>%
-  mutate(block = ifelse(mortality_level == "very_high", "mort", block))
+  mutate(block = ifelse(mortality_level == "very_high", "mort", block),
+         block = ifelse(scenario_name %in% c("2_Informative_Y08", "2_Informative_Tr0"), "sens", block))
 
 
-base_scenarios <- scenario_grid %>% filter(block %in% scenario_blocks) # scenario_blocks = main /supp/mort
+base_scenarios <- scenario_grid %>% filter(block %in% scenario_blocks) # scenario_blocks = main /supp/mort/sens
 if (nrow(base_scenarios) == 0) stop("no scenarios in block(s) ", paste(scenario_blocks, collapse = ", "))

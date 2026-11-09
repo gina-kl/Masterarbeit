@@ -2,7 +2,7 @@
 ##########################################################################################
 #------- Data generation ---------------------------------------------------------------##
 ##########################################################################################
-source("cluster_setup.R")   # run_on_cluster, n_cores_use, results_dir, part
+source("cluster_setup.R")   # run_on_cluster, n_cores_use, data_dir, part
 source("functions.R")       # analysis functions (tie_offset, save_rds_atomic)
 source("functions_dgp.R")   # data generating process: DAG, dropout, calibration, true values
 source("GlobalVars.R")
@@ -28,6 +28,10 @@ source("scenarios.R")
 # intercepts per scenario (calibration, functions_dgp.R), targets from GlobalVars.R
 base_scenarios <- calibrate_scenarios(base_scenarios)
 
+# limits of the stream ids (data_stream_id / true_stream_id, functions.R): data streams must stay below 1e5,
+# runs and blocks below 1000 per causal scenario
+stopifnot(max(scenario_grid$causal_id) <= 100, n_sim <= 1000, n_true / n_chunk_true <= 1000)
+
 message("Scenario blocks: ", paste(scenario_blocks, collapse = ", "),
         " | Number of Scenarios (base_scenarios): ", nrow(base_scenarios))   
 
@@ -47,13 +51,13 @@ if (!run_true && !run_data) stop("01_generate: argument must be 'true' or 'data'
 #   - mean numbers of falls: pooled over all blocks, LWYY / GL: mean of the block estimates
 #     (bias of a block estimate is O(1 / n_chunk_true), negligible)
 #   - Monte Carlo SE of each true value = sd over the blocks / sqrt(n_blocks)
-#   - seed depends only on scenario and block -> a larger n_true keeps the first blocks and adds new ones
+#   - random number stream depends only on scenario and block (true_stream_id) -> a larger n_true keeps the first blocks and adds new ones
 
 
 
 if (run_true) {   # cluster
   # unique causal scenarios
-  # causal_id from scenarios.R (complete grid) -> same id and seeds whichever blocks are run
+  # causal_id from scenarios.R (complete grid) -> same id and streams whichever blocks are run
   unique_causal_scenarios <- base_scenarios %>%
     distinct(causal_id, .keep_all = TRUE) %>%
     dplyr::select(causal_id, effect, all_of(causal_vars), Y_intercept, death_intercept, train_intercept)   # intercepts follow from causal_vars
@@ -78,19 +82,20 @@ if (run_true) {   # cluster
                          .combine = bind_rows,
                          .packages = c("simcausal", "dplyr", "tidyr", "survival", "mets"),
                          .export = c("COEF", "sim_dag", "simulate_true", "prep_data_true", "tie_offset", "true_block",
-                                     "model_mcf", "unique_causal_scenarios", "true_tasks", "n_chunk_true")) %dopar% {
+                                     "model_mcf", "unique_causal_scenarios", "true_tasks", "n_chunk_true",
+                                     "rng_stream", "sub_stream", "use_stream", "true_stream_id", "master_seed")) %dopar% {
                                        i <- true_tasks$causal_id[j]  # scenario
                                        k <- true_tasks$block[j]     # block
-                                       # unique per scenario and block, separate from the data seeds (1e6 * causal_id + run, dropout + 5e8)
+                                       # own stream per scenario and block (ids from 1e5 on, separate from the data streams)
                                        # row by causal_id (not by position, the ids are not consecutive within a block)
                                        true_block(unique_causal_scenarios[unique_causal_scenarios$causal_id == i, ], k,
-                                                  n_chunk_true, seed = 1e9 + 1e5 * i + k)
+                                                  n_chunk_true, rng = rng_stream(true_stream_id(i, k)))
                                      }
   
   stopCluster(cl)
   
-  # cluster: results_dir instead "./results" 
-  saveRDS(true_blocks, file.path(results_dir, "00_true_blocks.rds"))    # block results: check MC error, add blocks later
+  # cluster: data_dir instead "./results" 
+  saveRDS(true_blocks, file.path(data_dir, "00_true_blocks.rds"))    # block results: check MC error, add blocks later
   
   # Monte Carlo SE over the blocks (SE=s/sqrt(n))
   mcse <- function(x) if (length(x) > 1) sd(x) / sqrt(length(x)) else NA_real_ 
@@ -163,10 +168,10 @@ if (run_true) {   # cluster
                   LogRR_Q1, LogRR_Q2, LogRR_Q3, LogRR_Q4,
                   N_True, starts_with("MCSE_"))
   
-  write_csv(true_estimands_df, file.path(results_dir, "00_true_estimands.csv"))
+  write_csv(true_estimands_df, file.path(data_dir, "00_true_estimands.csv"))
 
   # scenario list for 03
-  write_csv(base_scenarios, file.path(results_dir, "00_base_scenarios.csv"))
+  write_csv(base_scenarios, file.path(data_dir, "00_base_scenarios.csv"))
 
   cat("True values are simulated and saved.\n")
   
@@ -194,16 +199,17 @@ if (run_data) {   # cluster ---- start "data" ----------------------------------
     base_scenarios %>% filter(scenario_id %in% scenario_ids),   # cluster
     sim_run = 1:n_sim
   ) %>%
-    mutate(seed      = 1e6 * causal_id + sim_run,   # same complete data for all scenarios with the same causal parameters
-           seed_drop = seed + 5e8,                  # own stream for dropout (same uniforms for all dropout mechanisms)
-           file_path = file.path(results_dir,                    
+    # own random number stream per data set (functions.R, Section 7), saved in the log:
+    # same stream -> same complete data and same dropout uniforms for all scenarios with the same causal parameters
+    mutate(stream_id = data_stream_id(causal_id, sim_run),
+           file_path = file.path(data_dir,                    
                                  sprintf("Odat_scen%02d_run%04d.rds", scenario_id, sim_run)))
   
   # all data sets of the scenario(s) are always generated again, existing files are overwritten
   # (cluster: after a restart the whole scenario is computed again, about 12 min)
   if (!run_on_cluster) {
     #local: remove all old data
-    file.remove(list.files(results_dir, pattern = "^Odat_.*\\.rds$", full.names = TRUE))
+    file.remove(list.files(data_dir, pattern = "^Odat_.*\\.rds$", full.names = TRUE))
   }
 
   # Setup parallel worker again for the main loop
@@ -218,14 +224,16 @@ if (run_data) {   # cluster ---- start "data" ----------------------------------
   results_log <- foreach(i = 1:nrow(scenarios),
                          .combine = bind_rows,
                          .packages = c("simcausal", "dplyr", "tidyr", "tibble", "magrittr"),   # instead of tidyverse
-                         .export = c("COEF", "sim_dag", "add_dropout", "simulate_scenario", "save_rds_atomic")) %dopar% {
+                         .export = c("COEF", "sim_dag", "add_dropout", "simulate_scenario", "save_rds_atomic",
+                                     "rng_stream", "sub_stream", "use_stream", "master_seed", "summarise_odat")) %dopar% {
 
                            p <- scenarios[i, ]      # Current parameters
+                           rng <- rng_stream(p$stream_id)   # start of the stream of this data set
 
                            # Generate data
                            sim_data <- simulate_scenario(
-                             seed = p$seed,
-                             seed_drop = p$seed_drop,
+                             rng = rng,                     # substream 0: complete data
+                             rng_drop = sub_stream(rng, 1), # substream 1: dropout uniforms
                              n_pts = p$n_pts,
                              true_beta_arm = p$true_beta_arm,
                              drop_beta_arm = p$drop_beta_arm,
@@ -242,11 +250,12 @@ if (run_data) {   # cluster ---- start "data" ----------------------------------
                              train_frailty_eff = p$train_frailty_eff
                            )
 
-                           # Save individual dataset (path set above: results_dir/Odat_scenXX_runYYYY.rds)
+                           # Save individual dataset (path set above: data_dir/Odat_scenXX_runYYYY.rds)
                            # atomic -> no broken file if the job is killed while saving
                            save_rds_atomic(sim_data, p$file_path)
 
-                           return(p)
+                           # parameters and summary of the data set -> row of the log (for 04_overview.R)
+                           return(bind_cols(p, summarise_odat(sim_data)))
                          }
 
   stopCluster(cl)
@@ -255,9 +264,9 @@ if (run_data) {   # cluster ---- start "data" ----------------------------------
   # Save logbook (one row per data set)
   # local: one log for everything, cluster: one log per scenario (no simultaneous writing)
   log_file <- if (run_on_cluster) {
-    file.path(results_dir, sprintf("00_simulation_log_scen%02d.csv", scenario_ids))   
+    file.path(data_dir, sprintf("00_simulation_log_scen%02d.csv", scenario_ids))   
   } else {
-    file.path(results_dir, "00_simulation_log.csv")
+    file.path(data_dir, "00_simulation_log.csv")
   }
   write_csv(results_log, log_file)
   cat(nrow(results_log), "data sets in log:", log_file, "\n")

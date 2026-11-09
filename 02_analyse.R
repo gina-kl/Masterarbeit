@@ -101,7 +101,7 @@ print(summary_stat_full)
 #   week t are observed before a dropout at the end of week t
 # Unstabilised weights (ipwtm without numerator) are needed for the mean number of falls (Section 5).
 
-Odat_w <- compute_weights(Odat)
+Odat_w <- compute_weights(Odat, interval_weeks)
 
 
 
@@ -176,11 +176,11 @@ mcf_mets(Odat_all, Odat_w) %>%
   print()
 
 # time-varying effect: mean falls per quarter (as MCF-Q1..Q4 in 03), here for IPCW sym
-mcf_q_sym <- weighted_mcf(Odat_w, "wm_sym", breaks = c(0, 13, 26, 39, 52) / interval_weeks) %>%
+mcf_q_sym <- if (current_params$true_beta_arm[1] != 0 && 13 %% interval_weeks == 0) { weighted_mcf(Odat_w, "wm_sym", breaks = c(0, 13, 26, 39, 52) / interval_weeks) %>%
   pivot_wider(names_from = arm, values_from = MCF, names_prefix = "arm") %>%
   mutate(Log_Ratio     = log(arm1 / arm0),
          True_LogRatio = unlist(truth[paste0("LogRR_Q", period)]))   # true log ratio per quarter
-print(mcf_q_sym)
+print(mcf_q_sym)}
 
 
 
