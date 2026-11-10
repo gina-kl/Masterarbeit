@@ -416,8 +416,8 @@ if (run_aggregate) {   # ---------------- "aggregate" ------------------------
       # bootstrap (only runs with bootstrap; NaN / 0 without bootstrap)
       n_boot_runs        = sum(!is.na(Boot_SE)),
       mean_n_boot_ok     = mean(n_boot_ok, na.rm = TRUE),                # successful bootstrap samples per run
-      mean_boot_SE       = mean(Boot_SE, na.rm = TRUE),
-      boot_SE_ratio      = mean_boot_SE / empirical_SE,                  # ~1: bootstrap SE fits
+      mean_boot_SE  = sqrt(mean(Boot_SE^2, na.rm = TRUE)),            # same as mean_model_SE
+      boot_SE_ratio = mean_boot_SE / sd(Estimate[!is.na(Boot_SE)]),   # only runs with bootstrap         
       boot_coverage_wald = mean(Boot_Covered_wald, na.rm = TRUE),        # Wald CI with bootstrap SE
       boot_coverage_perc = mean(Boot_Covered_perc, na.rm = TRUE),        # percentile CI
       mcse_boot_coverage_wald = sqrt(boot_coverage_wald * (1 - boot_coverage_wald) / n_boot_runs),

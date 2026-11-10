@@ -9,8 +9,7 @@ if (!exists("run_on_cluster")) run_on_cluster <- FALSE
 # Simulations
 n_sim <- if(run_on_cluster) 1000 else 2                 
 n_true  <- if(run_on_cluster) 4e6 else 20000  # patients per arm for Monte Carlo for true values
-# 4e6 (400 blocks): MCSE of the true values ~0.001 (1e6: ~0.002 = 50-80 % of the MCSE of the bias in the simulation)
-# if job_true takes too long: set back to 1e6 (100 blocks, about 4x faster, MCSE ~0.002), then also --time in job_true.sh
+# 4e6 (400 blocks): MCSE of the true values ~0.001 
 
 # For small test on cluster: (set by "bash cluster_jobs/submit_all.sh test"),
 # without the environment variables N_SIM / N_TRUE nothing changes
@@ -46,7 +45,7 @@ interval_weeks <- 1
 if (Sys.getenv("INTERVAL_WEEKS") != "") interval_weeks <- as.integer(Sys.getenv("INTERVAL_WEEKS"))
 
 # folders (cluster_setup.R)
-#   data_subdir:    data sets, logs, true values -> only the blocks (01)
+#   data_subdir: data sets, logs, true values -> only the blocks (01)
 #   results_subdir: analysis, bootstrap, aggregated results -> blocks + interval_weeks (03, 06)
 #   -> an interval analysis uses the data and true values of the weekly run with the same blocks
 data_subdir    <- paste(sort(unique(scenario_blocks)), collapse = "_")
@@ -76,5 +75,11 @@ if (Sys.getenv("N_BOOT") != "") {
   message("TEST override: n_boot = ", n_boot)
 }
 boot_max_run <- 200 # MCSE of the coverage about 1.5 percentage points; bootstrap only for runs with sim_run <= boot_max_run, Inf = all runs, 0 = no bootstrap
+# override per submission without editing (read when the job starts, set when submitting):
+#   BOOT_MAX_RUN=0 SCENARIO_BLOCKS=supp bash cluster_jobs/submit_all.sh   -> supp without bootstrap
+if (Sys.getenv("BOOT_MAX_RUN") != "") {
+  boot_max_run <- as.numeric(Sys.getenv("BOOT_MAX_RUN"))
+  message("override: boot_max_run = ", boot_max_run)
+}
 boot_scenarios <- c("2_Informative", "4_ObsDropout") # bootstrap only in these scenarios (scenario_name), NULL = all scenarios
 # bootstrap sample b uses substream 2 + b of the data stream of the run (functions.R, Section 7)

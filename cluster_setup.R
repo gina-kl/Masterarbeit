@@ -8,6 +8,7 @@
 # override possible: set run_on_cluster before source("cluster_setup.R") (e.g. time_check.R)
 
 if (!exists("run_on_cluster")) run_on_cluster <- Sys.getenv("SLURM_JOB_ID") != ""  
+source("GlobalVars.R")   # interval_weeks, data_subdir, results_subdir (local and cluster)
 
 if (run_on_cluster) {
   #   Rscript 01_generate_weekly_cluster.R true        -> only true values (single job, no array)
@@ -33,21 +34,20 @@ if (run_on_cluster) {
   # results in workspace
   sim_dir <- Sys.getenv("SIM_DIR")
   if (sim_dir == "") stop("SIM_DIR missing, set in Job-script")
-  if (!startsWith(sim_dir, "/")) stop("SIM_DIR must be an absolute path, not: ", sim_dir)   # NEU
-  source("GlobalVars.R")                                        # NEU: results_subdir (scenario blocks)
-  results_dir <- file.path(sim_dir, "results", results_subdir)  # NEU: own folder per block selection
+  if (!startsWith(sim_dir, "/")) stop("SIM_DIR must be an absolute path, not: ", sim_dir)   
+  data_dir    <- file.path(sim_dir, "results", data_subdir)     # data sets, logs, true values (01)
+  results_dir <- file.path(sim_dir, "results", results_subdir)  # analysis, bootstrap, aggregated results (03, 06)
 
 } else {
   part        <- "all"                               # local: true_values and all scenarios
   n_cores_use <- max(1, parallel::detectCores() - 1)
   array_id    <- NA
-  results_dir <- "./results"
+  data_dir    <- "./results"
+  results_dir <- if (interval_weeks > 1) file.path("./results", paste0("int", interval_weeks)) else "./results"
 }
 
+dir.create(data_dir,    showWarnings = FALSE, recursive = TRUE)
 dir.create(results_dir, showWarnings = FALSE, recursive = TRUE)
-
-message("Modus: ", if (run_on_cluster) "CLUSTER" else "LOKAL",
-        " | part: ", part,
-        " | kernels: ", n_cores_use,
+message("Modus: ", if (run_on_cluster) "CLUSTER" else "LOKAL", " | part: ", part, " | kernels: ", n_cores_use,
         if (!is.na(array_id)) paste0(" | Array-Task: ", array_id) else "",
-        " | results: ", results_dir)
+        " | data: ", data_dir, " | results: ", results_dir)
