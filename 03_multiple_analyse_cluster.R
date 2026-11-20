@@ -116,13 +116,23 @@ analyse_one_run <- function(file_path, sim_log, true_estimands) {
   # of the stabilised weights w_* (models) and the unstabilised weights wm_* (MCF), e.g. column max_wm_sym
   w_cols <- c("w_sym", "w_symtrain", "w_oracle", "wm_sym", "wm_symtrain", "wm_oracle",
               if (use_proxy) c("w_P_p4", "w_P_p2", "w_P_p1", "w_P_p05", "w_P_p025",
-                               "wm_P_p4", "wm_P_p2", "wm_P_p1", "wm_P_p05", "wm_P_p025"))
+                               "wm_P_p4", "wm_P_p2", "wm_P_p1", "wm_P_p05", "wm_P_p025",
+                               "wm_base", "wm_L1"))
   w_diag <- Odat_w %>%
     summarise(across(all_of(w_cols),
                      list(max = max,
                           q99 = ~ quantile(.x, 0.99, names = FALSE),
                           ess = ~ sum(.x)^2 / sum(.x^2) / n()),
                      .names = "{.fn}_{.col}"))
+
+  # the same per arm, only maximum and ESS of the MCF weights (beta_C = -1: more dropout in the control
+  # arm -> larger weights there), e.g. column arm0_ess_wm_sym
+  arm_cols <- c("wm_sym", "wm_symtrain", "wm_oracle", if (use_proxy) c("wm_P_p1", "wm_P_p05"))
+  w_diag_arm <- Odat_w %>%
+    group_by(arm) %>%
+    summarise(across(all_of(arm_cols), list(max = max, ess = ~ sum(.x)^2 / sum(.x^2) / n()),
+                     .names = "{.fn}_{.col}"), .groups = "drop") %>%
+    pivot_wider(names_from = arm, values_from = -arm, names_glue = "arm{arm}_{.value}")
 
   # -- Models ------------------------------------
   # prep_counting(): prepare data for counting data
@@ -134,26 +144,29 @@ analyse_one_run <- function(file_path, sim_log, true_estimands) {
                   scenario_id = current_params$scenario_id[1], sim_run = current_params$sim_run[1]))
   }
 
-  # true value of all models: limit of Ghosh-Lin on complete data = treatment-policy value (real world with death)
-  # LWYY treats death as censoring (rate among the living): with mortality its own limit True_Beta_LWYY differs,
-  # this difference shows in the bias of "LWYY 0: Full data". Without death both true values are the same.
+  # true value per model = its own limit on complete data (00_true_estimands.csv)
+  #   Ghosh-Lin: True_Beta_GL = treatment-policy value (real world with death)
+  #   LWYY (death = censoring, rate among the living): True_Beta_LWYY
+  # without death both are the same; with death the difference is an estimand difference, no dropout bias
+  # (reported separately: True_Beta_LWYY - True_Beta_GL)
   model_results <- bind_rows(lapply(names(fits), function(m) {
-    extract_model_results(fits[[m]], m, truth$True_Beta_GL)
+    true_m <- if (startsWith(m, "LWYY")) truth$True_Beta_LWYY else truth$True_Beta_GL
+    extract_model_results(fits[[m]], m, true_m)
   }))
 
   # -- Mean number of falls until week 52 (nonparametric and model estimate) --------------------------------
 
   # mean falls per arm (model-based = same model as the LWYY / GL row,
   # log(mu_1 / mu_0) is exactly the arm coefficient -> only the levels per arm are new)
-  # true values of all rows: real world with death (MCF_*); with mortality LWYY overestimates the levels
-  # (the dead have no more falls), its own limit on complete data is MCF_LWYY_* (00_true_estimands.csv)
+  # true values as for the coefficients: GL and nonparametric MCF: real world with death (MCF_*),
+  # LWYY: its own limit on complete data MCF_LWYY_* (with death higher, the dead have no more falls)
   mcf_est <- mcf_estimate(Odat_all, Odat_w, fits, use_proxy)
 
-  mcf_results <- tibble(Model                 = sub("^MCF-", "", names(mcf_est)),
-                        MCF_Control_hat       = sapply(mcf_est, `[`, 1),
-                        MCF_Intervention_hat  = sapply(mcf_est, `[`, 2),
-                        true_mcf_control      = truth$MCF_Control,
-                        true_mcf_intervention = truth$MCF_Intervention)
+  mcf_results <- tibble(Model                = sub("^MCF-", "", names(mcf_est)),
+                        MCF_Control_hat      = sapply(mcf_est, `[`, 1),
+                        MCF_Intervention_hat = sapply(mcf_est, `[`, 2)) %>%
+    mutate(true_mcf_control      = ifelse(startsWith(Model, "LWYY"), truth$MCF_LWYY_Control,      truth$MCF_Control),
+           true_mcf_intervention = ifelse(startsWith(Model, "LWYY"), truth$MCF_LWYY_Intervention, truth$MCF_Intervention))
 
   # nonparametric MCF: own rows, estimate = log ratio of mean falls (real world)
   # robust SE of the log ratio from mets (mcf_mets, functions.R) -> CI, test and coverage as for LWYY / GL
@@ -209,6 +222,7 @@ analyse_one_run <- function(file_path, sim_log, true_estimands) {
 
   results %>%
     cross_join(w_diag) %>%                                  # weight diagnostics (one row) in every row
+    cross_join(w_diag_arm) %>%                              # weights per arm (one row)
     cross_join(proxy_cor) %>%                               # proxy strength (one row) in every row
     mutate(
       Method = sub(" .*", "", Model),                       # LWYY / GL / MCF
@@ -410,6 +424,7 @@ if (run_aggregate) {   # ---------------- "aggregate" ------------------------
       mcse_coverage = sqrt(coverage * (1 - coverage) / n_se),
       be_coverage   = mean(CI_low <= mean_estimate & mean_estimate <= CI_high, na.rm = TRUE),   # bias-eliminated coverage: mean estimate instead of the true value
       mcse_be_coverage = sqrt(be_coverage * (1 - be_coverage) / n_se),
+      mean_ci_width = mean(CI_high - CI_low, na.rm = TRUE),             # mean width of the 95 % CI
       power         = mean(Reject, na.rm = TRUE),                        # power (H1) / type I error (H0)
       mcse_power    = sqrt(power * (1 - power) / n_se),
       # bootstrap (only runs with bootstrap; NaN / 0 without bootstrap)
@@ -437,6 +452,8 @@ if (run_aggregate) {   # ---------------- "aggregate" ------------------------
       across(starts_with("cor_"), ~ mean(.x, na.rm = TRUE), .names = "mean_{.col}"),
       # weights (before truncation): mean over the runs of max, 99% percentile and relative ESS, e.g. mean_max_wm_sym
       across(matches("^(max|q99|ess)_w"), ~ mean(.x, na.rm = TRUE), .names = "mean_{.col}"),
+      # weights per arm (before truncation): mean over the runs, e.g. mean_arm0_ess_wm_sym
+      across(matches("^arm[01]_"), ~ mean(.x, na.rm = TRUE), .names = "mean_{.col}"),
       .groups = "drop"
     ) %>%
     dplyr::select(-var_var) %>%
@@ -446,7 +463,7 @@ if (run_aggregate) {   # ---------------- "aggregate" ------------------------
   # > 0: more precise than naive; only runs in which both models have an estimate
   ref <- all_results %>%
     filter(grepl(" 1: Naive", Model)) %>%
-    dplyr::select(scenario_id, Method, sim_run, Estimate_ref = Estimate)
+    dplyr::select(scenario_id, Method, sim_run, Estimate_ref = Estimate, Bias_ref = Bias)
 
   precision <- all_results %>%
     left_join(ref, by = c("scenario_id", "Method", "sim_run")) %>%
@@ -458,6 +475,9 @@ if (run_aggregate) {   # ---------------- "aggregate" ------------------------
       corr    = cor(Estimate, Estimate_ref),
       rel_precision      = 100 * (ratio2 - 1),
       mcse_rel_precision = 200 * ratio2 * sqrt((1 - corr^2) / (n_pairs - 1)),
+      # paired difference of the squared error vs naive (< 0: smaller squared error than naive)
+      d_sqerr      = mean(Bias^2 - Bias_ref^2),
+      mcse_d_sqerr = sd(Bias^2 - Bias_ref^2) / sqrt(n_pairs),
       .groups = "drop"
     ) %>%
     dplyr::select(-ratio2, -corr)

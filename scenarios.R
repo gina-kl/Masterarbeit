@@ -73,6 +73,30 @@ sens_rows <- bind_rows(
 
 scenario_grid <- bind_rows(scenario_grid, sens_rows)
 
+# different strength of informative dropout (block sens; only for beta_C = -1, no effect and low effect, no mortality)
+# - 2_Informative_Drop04: eff_frailty_drop = 0.4
+# - 2_Informative_Drop12: eff_frailty_drop = 1.2
+# same causal scenarios as S6 / S20 -> paired comparison
+drop_base <- scenario_grid %>%
+  filter(scenario_name == "2_Informative", mortality_level == "none", drop_beta_arm == -1)
+drop_rows <- bind_rows(
+    drop_base %>% filter(effect %in% c("none", "low"))%>%
+      mutate(scenario_name = "2_Informative_Drop04", eff_frailty_drop = 0.4),
+  drop_base %>% filter(effect %in% c("none", "low"))%>%
+    mutate(scenario_name = "2_Informative_Drop12", eff_frailty_drop = 1.2)) %>%
+  mutate(scenario_id = max(scenario_grid$scenario_id) + row_number())  
+
+scenario_grid <- bind_rows(scenario_grid, drop_rows)
+
+# stronger effect of frailty on death (block mort; very high mortality, beta_C = -1, H0 and low effect)
+#  - 2_Informative_Death12: eff_frailty_death = 1.2 (as strong as on the falls, instead of 0.6)
+# eff_frailty_death is a causal variable -> new causal_id: new complete data and new true values
+death_rows <- scenario_grid %>%
+  filter(scenario_name == "2_Informative", mortality_level == "very_high", drop_beta_arm == -1) %>%   
+  mutate(scenario_name = "2_Informative_Death12", eff_frailty_death = 1.2,
+         scenario_id = max(scenario_grid$scenario_id) + row_number())                                  
+scenario_grid <- bind_rows(scenario_grid, death_rows)
+
 # causal scenario: same causal parameters -> same complete data (same seed) and same truth
 # numbering in order of first appearance on the complete grid
 causal_ids <- scenario_grid %>%
@@ -86,15 +110,19 @@ scenario_grid <- scenario_grid %>% left_join(causal_ids, by = causal_vars)
 #         4_ObsDropout x low x drop_beta_arm (positive control) (6 scenarios)
 #   supp: reference / all others (1_NoFrailty, 3_NoInfDropout (negative control), 5_NoIndirect,
 #         high effect, mortality "high")
+#   mort: very high mortality (15 %): the main scenarios and 2_Informative_Death12 (eff_frailty_death 1.2) (8 scenarios)
+#   sens: sensitivity analyses of 2_Informative with beta_C = -1: Y08, Tr0 and
+#         Drop04 / Drop12 (eff_frailty_drop 0.4 / 1.2) (7 scenarios)
 scenario_grid <- scenario_grid %>%
   mutate(block = ifelse(mortality_level == "none" &
                           ((scenario_name == "2_Informative" & effect %in% c("none", "low")) |
                              (scenario_name == "4_ObsDropout" & effect == "low")),
                         "main", "supp"))
 scenario_grid <- scenario_grid %>%
-  mutate(block = ifelse(mortality_level == "very_high", "mort", block),
-         block = ifelse(scenario_name %in% c("2_Informative_Y08", "2_Informative_Tr0"), "sens", block))
-
+  mutate(block = ifelse(mortality_level == "very_high", "mort", block),          # also 2_Informative_Death12
+         block = ifelse(scenario_name %in% c("2_Informative_Y08", "2_Informative_Tr0",
+                                             "2_Informative_Drop04", "2_Informative_Drop12"), "sens", block))
 
 base_scenarios <- scenario_grid %>% filter(block %in% scenario_blocks) # scenario_blocks = main /supp/mort/sens
+
 if (nrow(base_scenarios) == 0) stop("no scenarios in block(s) ", paste(scenario_blocks, collapse = ", "))

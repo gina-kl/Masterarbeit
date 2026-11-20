@@ -30,8 +30,10 @@ master_seed <- 20261104
 # scenario blocks (defined in scenarios.R)
 #   "main": 6 core scenarios without mortality: 2_Informative (H0, low effect) and 4_ObsDropout (low effect, positive control), each with drop_beta_arm 0&-1
 #   "supp": all other scenarios (1_NoFrailty, 3_NoInfDropout (negative control), 5_NoIndirect, high effect, mortality "high")
-#   "mort": the main scenarios with very high mortality (15 %)
-#   "sens": sensitivity analyses of 2_Informative with beta_C = -1: eff_frailty_y = 0.8 (H0, low effect), eff_frailty_train = 0 (low effect)
+#   "mort": the main scenarios with very high mortality (15 %) and 2_Informative_Death12:
+#           stronger effect of frailty on death, eff_frailty_death = 1.2 (beta_C = -1, H0 and low effect)
+#   "sens": sensitivity analyses of 2_Informative with beta_C = -1: eff_frailty_y = 0.8 (H0, low effect), eff_frailty_train = 0 (low effect),
+#           dropout strength eff_frailty_drop = 0.4 / 1.2 (H0, low effect)
 
 scenario_blocks <- c("main")                 # c("main"), c("supp"), c("mort") or combinations
 if (Sys.getenv("SCENARIO_BLOCKS") != "") scenario_blocks <- strsplit(Sys.getenv("SCENARIO_BLOCKS"), ",")[[1]]
@@ -44,13 +46,29 @@ if (Sys.getenv("SCENARIO_BLOCKS") != "") scenario_blocks <- strsplit(Sys.getenv(
 interval_weeks <- 1
 if (Sys.getenv("INTERVAL_WEEKS") != "") interval_weeks <- as.integer(Sys.getenv("INTERVAL_WEEKS"))
 
+
+# proxy strength (before the folders: proxy_icc is part of results_subdir)
+# synthetic proxy P(t) = FrailtyT(t) + noise, measured in both arms
+proxy_sd <- c(p025 = 0.25, p4 = 4, p1 = 1, p05 = 0.5, p2 = 2)   # no P models: proxy_sd <- NULL
+proxy_scenarios <- c("2_Informative", "2_Informative_Y08",
+                     "2_Informative_Drop04", "2_Informative_Drop12")   # NOT <- NULL (then computed for all scenarios)
+# share of the proxy error that is person-specific (0 = new error at every measurement, 1 = same error at
+# each measurement, 0.5 = half new, half the same); proxy_icc = 0 gives exactly the former P values
+# cluster: set with the environment variable, GlobalVars.R stays at 0:
+#   PROXY_ICC=0.5 sbatch --array=2,5 cluster_jobs/job_analyse.sh   (results in results/main_icc50)
+proxy_icc <- 0
+if (Sys.getenv("PROXY_ICC") != "") proxy_icc <- as.numeric(Sys.getenv("PROXY_ICC"))
+
+
+
 # folders (cluster_setup.R)
 #   data_subdir: data sets, logs, true values -> only the blocks (01)
-#   results_subdir: analysis, bootstrap, aggregated results -> blocks + interval_weeks (03, 06)
+#   results_subdir: analysis, bootstrap, aggregated results -> blocks + interval_weeks + proxy_icc (03, 06)
 #   -> an interval analysis uses the data and true values of the weekly run with the same blocks
 data_subdir    <- paste(sort(unique(scenario_blocks)), collapse = "_")
-results_subdir <- paste0(data_subdir, if (interval_weeks > 1) paste0("_int", interval_weeks))
-
+results_subdir <- paste0(data_subdir,
+                         if (interval_weeks > 1) paste0("_int", interval_weeks),
+                         if (proxy_icc > 0) paste0("_icc", round(100 * proxy_icc)))   # e.g. main_icc50
 
 # target values for intercepts
 target_falls   <- 0.35                                          # percentage of units with at least one fall per year (control arm)
@@ -58,11 +76,6 @@ target_dropout <- 0.20                                          # perc with drop
 target_death   <- c(none = 0, high = 0.02, very_high = 0.15)    # mortality per year (none = no death)
 target_train   <- 0.63                                          # share of persons training in week 1 (training arm)
 
-# proxy strength
-# synthetic proxy P(t) = FrailtyT(t) + noise, measured in both arms
-proxy_sd <- c(p025 = 0.25,p4 = 4, p1=1, p05=0.5, p2=2)   # no P models: proxy_sd <- NULL
-proxy_scenarios <- c("2_Informative", "2_Informative_Y08")  # NOT <-NULL (then computet for all sceanrios)
-proxy_icc <- 0   # share of the proxy error that is person-specific (0 = new error at every measurement, 1 = same error at each measurement, 0.5= half new, half the same)
 
 
 # --- Variables for analyse -------------------------------

@@ -142,7 +142,7 @@ wald_results <- function(model_name, est, se, true_beta) {
 }
 
 # extract result out of cox model (LWYY) or recreg model (Ghosh-Lin)
-# true_beta: true value of the comparison (03: True_Beta_GL = treatment-policy value, for LWYY and GL)
+# true_beta: true value of the comparison (03: True_Beta_LWYY for LWYY, True_Beta_GL for GL)
 extract_model_results <- function(model, model_name, true_beta) {
   warn <- attr(model, "warn")                    # warnings of the fit (safe_fit in fit_models)
   res <- if (is.logical(model)) {
@@ -161,8 +161,9 @@ extract_model_results <- function(model, model_name, true_beta) {
 # Odat_w: obseved data set with ipcw weights (with compute weights)
 # same argument order as mcf_estimate(): fit_models(Odat_all, Odat_w)
 # fit LWYY and Gosh-Lin model with and without proxies
+# gl_wm: weights of the GL models; TRUE (data with deaths) = wm_*, FALSE (no deaths) = w_* as for LWYY
 
-fit_models <- function(Odat_all, Odat_w, use_proxy = FALSE){
+fit_models <- function(Odat_all, Odat_w, use_proxy = FALSE, gl_wm = any(Odat_all$death_full == 1)){
     cp      <- prep_counting(Odat_w, "observed")
     cp_full <- prep_counting(Odat_all, "full")
 
@@ -190,6 +191,11 @@ fit_models <- function(Odat_all, Odat_w, use_proxy = FALSE){
     }
 
     # GL: cens.model = ~ strata(arm) -> internal censoring Kaplan-Meier per arm
+    # GL weights: recreg keeps a dead person in the risk set with weight w(T) * G(t) / G(T), G = censoring
+    # Kaplan-Meier per arm. This is exact only if the numerator of the weights depends only on arm and time
+    # -> with deaths wm_* (check_gl_censmodel.R: w_oracle kept a bias of about 0.005, wm_oracle none);
+    #    without deaths G is not used and GL = LWYY -> same weights w_* as LWYY
+    gl_w <- if (gl_wm) "wm_" else "w_"
     # 6 / 7: truncated weights (sensitivity analysis, see compute_weights())
     fits <- list(
       "LWYY 0: Full data (oracle M0)" = safe_fit(coxph(f_lwyy, data = cp_full, ties = "breslow")),
@@ -202,24 +208,28 @@ fit_models <- function(Odat_all, Odat_w, use_proxy = FALSE){
       "GL 0: Full data (oracle M0)"   = safe_fit(recreg(f_gl, data = cp_full, cause = 1, death.code = 3, cens.code = 0, cens.model = ~ strata(arm), control = gl_ctrl)),
       "GL 1: Naive (Unweighted)"      = safe_fit(recreg(f_gl, data = cp, cause = 1, death.code = 3, cens.code = 0, cens.model = ~ strata(arm), control = gl_ctrl)),
       "GL 3: IPCW sym"                = safe_fit(recreg(f_gl, data = cp, cause = 1, death.code = 3, cens.code = 0, cens.model = ~ strata(arm),
-                                                        weights = cp$w_sym, control = gl_ctrl)),
+                                                        weights = cp[[paste0(gl_w, "sym")]], control = gl_ctrl)),
       "GL 4: IPCW sym_train"          = safe_fit(recreg(f_gl, data = cp, cause = 1, death.code = 3, cens.code = 0, cens.model = ~ strata(arm),
-                                                        weights = cp$w_symtrain, control = gl_ctrl)),
+                                                        weights = cp[[paste0(gl_w, "symtrain")]], control = gl_ctrl)),
       "GL 5: IPCW oracle"             = safe_fit(recreg(f_gl, data = cp, cause = 1, death.code = 3, cens.code = 0, cens.model = ~ strata(arm),
-                                                        weights = cp$w_oracle, control = gl_ctrl)),
+                                                        weights = cp[[paste0(gl_w, "oracle")]], control = gl_ctrl)),
       "GL 6: IPCW sym trunc"          = safe_fit(recreg(f_gl, data = cp, cause = 1, death.code = 3, cens.code = 0, cens.model = ~ strata(arm),
-                                                        weights = cp$w_sym_tr, control = gl_ctrl)),
+                                                        weights = cp[[paste0(gl_w, "sym_tr")]], control = gl_ctrl)),
       "GL 7: IPCW sym_train trunc"    = safe_fit(recreg(f_gl, data = cp, cause = 1, death.code = 3, cens.code = 0, cens.model = ~ strata(arm),
-                                                        weights = cp$w_symtrain_tr, control = gl_ctrl))
+                                                        weights = cp[[paste0(gl_w, "symtrain_tr")]], control = gl_ctrl))
     )
 
-    # 8 - 12: proxy variants sym + P (only if use_proxy = only without mortality), LWYY only (GL = LWYY without mortality)
+    # 8 - 14: proxy variants (only if use_proxy = only without mortality), LWYY only (GL = LWYY without mortality)
+    #   8 - 12: sym + P in both arms, 13 / 14: P only in the training arm (control arm: sym)
     if (use_proxy) {
       fits[["LWYY 8: IPCW sym+P sd=4"]] <- safe_fit(coxph(f_lwyy, data = cp, ties = "breslow", weights = cp$w_P_p4))
       fits[["LWYY 9: IPCW sym+P sd=2"]]    <- safe_fit(coxph(f_lwyy, data = cp, ties = "breslow", weights = cp$w_P_p2))
       fits[["LWYY 10: IPCW sym+P sd=1"]]    <- safe_fit(coxph(f_lwyy, data = cp, ties = "breslow", weights = cp$w_P_p1))
       fits[["LWYY 11: IPCW sym+P sd=0.5"]] <- safe_fit(coxph(f_lwyy, data = cp, ties = "breslow", weights = cp$w_P_p05))
       fits[["LWYY 12: IPCW sym+P sd=0.25"]]    <- safe_fit(coxph(f_lwyy, data = cp, ties = "breslow", weights = cp$w_P_p025))
+      # 13 / 14: P only in the training arm (control arm: sym); names without "sym+P" (05 filters the proxy curve with it)
+      fits[["LWYY 13: IPCW P only train arm sd=1"]]   <- safe_fit(coxph(f_lwyy, data = cp, ties = "breslow", weights = cp$w_P1_one))
+      fits[["LWYY 14: IPCW P only train arm sd=0.5"]] <- safe_fit(coxph(f_lwyy, data = cp, ties = "breslow", weights = cp$w_P05_one))
     }
     fits
 }
@@ -343,7 +353,25 @@ compute_weights <- function(dat, interval_weeks, trunc_q = 0.99, use_proxy = FAL
                                       denominator = ~ age + sex + log_base_falls + ns(tstop, df = 3) + log_falls_lag + P_p4,
                                       id = ID, tstart = tstart, timevar = tstop, type = "cens", data = d_fit))
         
+        # one-sided proxy: P only in the training arm, the control arm keeps sym
+        # (as for sym_train), no new fits, the weights of both arms exist already
+        in_train <- d_all$arm[1] ==1
+        d_all$w_P1_one <- if(in_train) d_all$w_P_p1 else w_sym
+        d_all$wm_P1_one  <- if (in_train) d_all$wm_P_p1  else wm_sym
+        d_all$w_P05_one  <- if (in_train) d_all$w_P_p05  else w_sym
+        d_all$wm_P05_one <- if (in_train) d_all$wm_P_p05 else wm_sym
         
+        # MCF steps (unstabilised, numerator only time): how much bias does each source of information remove?
+        # step 1 = age, sex, time; step 2 = + L1; step 3 = + falls history (= wm_sym)
+        # step 4 = + training (wm_symtrain) or + P (wm_P_*)
+        d_all$wm_base <- shift(ipwtm(exposure = drop, family = "binomial", link = "logit",
+                                     numerator   = ~ ns(tstop, df = 3),
+                                     denominator = ~ age + sex + ns(tstop, df = 3),
+                                     id = ID, tstart = tstart, timevar = tstop, type = "cens", data = d_fit))
+        d_all$wm_L1   <- shift(ipwtm(exposure = drop, family = "binomial", link = "logit",
+                                     numerator   = ~ ns(tstop, df = 3),
+                                     denominator = ~ age + sex + log_base_falls + ns(tstop, df = 3),
+                                     id = ID, tstart = tstart, timevar = tstop, type = "cens", data = d_fit))
         
       }
       d_all %>% mutate(w_sym = w_sym, w_symtrain = w_symtrain, w_oracle = w_oracle,
@@ -422,7 +450,7 @@ weighted_mcf <- function(d, w = "w", falls = "n_falls", death = "death", breaks 
 # prediction for every person with arm set to 0 / 1, averaged over all persons
 # base_cov: one row per person with the covariates of the model (age, sex, log_base_falls)
 # Ghosh-Lin (recreg): mu_0(t) * exp(X beta)     -> real world with death (compare with MCF_*)
-# LWYY (coxph):       Lambda_0(t) * exp(X beta) -> also compared with MCF_* (03); with death too high, because the
+# LWYY (coxph):       Lambda_0(t) * exp(X beta) -> compared with its own limit MCF_LWYY_* (03); with death higher, because the
 #                     dead have no more falls. Its own limit on complete data is MCF_LWYY_* (true_block() in
 #                     functions_dgp.R); it equals the world without death (MCF_*_NoDeath) only if death is
 #                     independent of the falls given the covariates (here not: death depends on frailty)
@@ -464,6 +492,10 @@ mcf_estimate <- function(Odat_all, Odat_w, fits = NULL, use_proxy = FALSE){
     mcf_list[["MCF 10: IPCW sym+P sd=1"]]    <- weighted_mcf(Odat_w, "wm_P_p1")
     mcf_list[["MCF 11: IPCW sym+P sd=0.5"]] <- weighted_mcf(Odat_w, "wm_P_p05")
     mcf_list[["MCF 12: IPCW sym+P sd=0.25"]] <- weighted_mcf(Odat_w, "wm_P_p025")
+    mcf_list[["MCF 13: IPCW P only train arm sd=1"]] <- weighted_mcf(Odat_w , "wm_P1_one")
+    mcf_list[["MCF 14: IPCW P only train arm sd=0.5"]] <- weighted_mcf(Odat_w, "wm_P05_one")
+    mcf_list[["MCF 15: IPCW step age+sex+time"]]       <- weighted_mcf(Odat_w, "wm_base")
+    mcf_list[["MCF 16: IPCW step +L1"]]                <- weighted_mcf(Odat_w, "wm_L1")
   }
   base_cov <- Odat_all %>% filter(t == 1) %>% dplyr::select(ID, age, sex, log_base_falls)   # one row per person
   c(
@@ -509,6 +541,10 @@ mcf_mets <- function(Odat_all, Odat_w, use_proxy = FALSE) {
     m[["MCF 10: IPCW sym+P sd=1"]]    <- mets_mcf(cp, "wm_P_p1")
     m[["MCF 11: IPCW sym+P sd=0.5"]] <- mets_mcf(cp, "wm_P_p05")
     m[["MCF 12: IPCW sym+P sd=0.25"]] <- mets_mcf(cp, "wm_P_p025")
+    m[["MCF 13: IPCW P only train arm sd=1"]] <- mets_mcf(cp, "wm_P1_one")
+    m[["MCF 14: IPCW P only train arm sd=0.5"]] <- mets_mcf(cp, "wm_P05_one")
+    m[["MCF 15: IPCW step age+sex+time"]] <- mets_mcf(cp, "wm_base")
+    m[["MCF 16: IPCW step +L1"]] <- mets_mcf(cp, "wm_L1")
   }
   tibble(Model                 = names(m),
          MCF_Control_mets      = sapply(m, `[[`, "mu_0"),
