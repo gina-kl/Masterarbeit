@@ -26,7 +26,7 @@ scenarios_def <- tribble(
 
 # treatment effect: direct effect (true_beta_arm) and maximal frailty reduction by training (max_frailty_red)
 # none: H0 (no direct effect, training does not change frailty either)
-# low:  realistic, marginal log RR about -0.29 in 2_Informative, at least one fall: 35 % -> about 28 % (SURE-FIT protocol: 35 % -> 28 %)
+# low:  realistic, marginal log RR about -0.29 in 2_Informative, at least one fall: 35 % -> about 28 %
 # high: former effect, stronger than in exercise trials
 effect_def <- tribble(
   ~effect, ~true_beta_arm, ~max_frailty_red, 
@@ -48,7 +48,7 @@ scenario_grid <- expand_grid(
   mutate(train_frailty_eff = ifelse(effect == "none", 0, train_frailty_eff),   # strict H0: no effect via training either
          scenario_id = row_number())
 
-# add very high mortality for main scenarios. Is appended at the end (scenarios ids are not changed)
+# add very high mortality for main scenarios
 mort_rows <- scenario_grid %>%
   filter(mortality_level == "none" &    # each combination only once
            ((scenario_name == "2_Informative" & effect %in% c("none", "low")) |
@@ -57,7 +57,7 @@ mort_rows <- scenario_grid %>%
 
 scenario_grid <- bind_rows(scenario_grid, mort_rows)
 
-# sensitivity analyses, only beta_C = -1 (with beta_C = 0 the naive log ratio is almost unbiased)
+# sensitivity analyses, only beta_C = -1 (unbalanced dropout)
 #  - 2_Informative_Y08: weaker effect of frailty on falls (H0 and low effect)
 #  - 2_Informative_Tr0: training does not depend on frailty, train_rate_lag is no proxy (low effect)
 # own names: the true values are matched by scenario name, mortality and beta

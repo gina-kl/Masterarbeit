@@ -7,7 +7,7 @@ source("functions.R")       # analysis functions (tie_offset, save_rds_atomic)
 source("functions_dgp.R")   # data generating process: DAG, dropout, calibration, true values
 source("GlobalVars.R")
 
-# Load packages, Rscript on the cluster starts without any packages
+# Load packages
 library(simcausal)
 # single packages instead of tidyverse (tidyverse cannot be installed on the cluster)
 library(dplyr)
@@ -22,7 +22,7 @@ library(mets)       # true values: Ghosh-Lin
 
 
 #------------------- Scenarios -----------------------------------------------------------##
-# scenario definitions, effects, blocks, scenario_id and causal_id: scenarios.R
+# scenario definitions, effects, blocks, scenario_id and causal_id
 source("scenarios.R")
 
 # intercepts per scenario (calibration, functions_dgp.R), targets from GlobalVars.R
@@ -97,7 +97,7 @@ if (run_true) {   # cluster
   # cluster: data_dir instead "./results" 
   saveRDS(true_blocks, file.path(data_dir, "00_true_blocks.rds"))    # block results: check MC error, add blocks later
   
-  # Monte Carlo SE over the blocks (SE=s/sqrt(n))
+  # Monte Carlo SE over the blocks (SE=s/sqrt(n)) (sd over the blocks divided by number of blocks)
   mcse <- function(x) if (length(x) > 1) sd(x) / sqrt(length(x)) else NA_real_ 
   
   true_estimands_df <- true_blocks %>%
@@ -127,7 +127,7 @@ if (run_true) {   # cluster
       MCF_Intervention          = y_int     / N_True,
       MCF_Control_NoDeath       = y_ctrl_nd / N_True,
       MCF_Intervention_NoDeath  = y_int_nd  / N_True,
-      True_LogRateRatio         = log(MCF_Intervention / MCF_Control),                 # ratio of mean falls (nonparametric GL, marginal)
+      True_LogRateRatio         = log(MCF_Intervention / MCF_Control),                  # log ratio of the mean falls per person (counted on complete data with death, no model), target of nonparametric MCF
       True_LogRateRatio_NoDeath = log(MCF_Intervention_NoDeath / MCF_Control_NoDeath), # hypothetical, no death
       LogRR_Q1                  = log(y_int_Q1 / y_ctrl_Q1),         # time-varying effect per quarter
       LogRR_Q2                  = log(y_int_Q2 / y_ctrl_Q2),

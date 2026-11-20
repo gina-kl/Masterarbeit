@@ -492,8 +492,7 @@ true_block <- function(p, block, n_chunk, rng) {
   # same models as in the analysis, fitted on the complete data of this block
   fit_lwyy <- coxph(Surv(start, stop, status == 1) ~ arm + age + sex + log_base_falls,
                     data = ag, ties = "breslow")
-  # Armijo line search as in fit_models() (gl_ctrl): without it Newton-Raphson diverged (NaN) in a block with one
-  # very frail person (144 falls, supp causal_id 12 block 158); normal blocks unchanged (difference < 1e-7)
+  # Armijo line search as in fit_models() (gl_ctrl): without it Newton-Raphson diverged (NaN) in a block with one very frail person 
   fit_gl   <- recreg(Event(start, stop, status) ~ arm + age + sex + log_base_falls + cluster(ID),
                      data = ag, cause = 1, death.code = 3, cens.code = 0,
                      control = list(tol = 1e-12, backtrack = "armijo"))

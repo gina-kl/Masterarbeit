@@ -28,6 +28,7 @@ source("GlobalVars.R")
 sim_log        <- read_csv("./results/00_simulation_log.csv", show_col_types = FALSE)
 true_estimands <- read_csv("./results/00_true_estimands.csv", show_col_types = FALSE)
 
+
 # choose the data set by its parameters, not by scenario number (numbers change with the design)
 current_params <- sim_log %>%
   filter(scenario_name == "2_Informative", effect == "low", drop_beta_arm == -1, mortality_level == "none", sim_run == 1)
@@ -149,22 +150,20 @@ print(summary(fits[["LWYY 3: IPCW sym"]]))             # look at single models i
 # - nonparametric: mu_a(52) = sum_t S_a(t-1) * dR_a(t), weighted Nelson-Aalen + weighted Kaplan-Meier per arm
 #   (weighted_mcf with the unstabilised weights wm_*)
 # - model-based: standardised prediction of every LWYY / GL fit (model_mcf)
-# true values: LWYY -> limit of the LWYY fit on complete data (MCF_LWYY_*, as True_Beta_LWYY),
-#              GL and nonparametric MCF -> real world with death
+# true values of all rows: real world with death (as in 03); with mortality LWYY overestimates the levels,
+# its own limit on complete data is MCF_LWYY_* / True_Beta_LWYY
 mcf_est <- mcf_estimate(Odat_all, Odat_w, fits)
 
 mean_falls_table <- tibble(Model            = names(mcf_est),
                            MCF_Control      = sapply(mcf_est, `[`, 1),
                            MCF_Intervention = sapply(mcf_est, `[`, 2)) %>%
-  mutate(lwyy                  = startsWith(Model, "MCF-LWYY"),   # LWYY: limit on complete data
-         True_MCF_Control      = if_else(lwyy, truth$MCF_LWYY_Control,      truth$MCF_Control),
-         True_MCF_Intervention = if_else(lwyy, truth$MCF_LWYY_Intervention, truth$MCF_Intervention),
-         True_LogRatio         = if_else(lwyy, truth$True_Beta_LWYY,        truth$True_LogRateRatio),
+  mutate(True_MCF_Control      = truth$MCF_Control,
+         True_MCF_Intervention = truth$MCF_Intervention,
+         True_LogRatio         = truth$True_LogRateRatio,
          Bias_MCF_Control      = MCF_Control - True_MCF_Control,
          Bias_MCF_Intervention = MCF_Intervention - True_MCF_Intervention,
          Log_Ratio             = log(MCF_Intervention / MCF_Control),
-         Bias                  = Log_Ratio - True_LogRatio) %>%
-  dplyr::select(-lwyy)
+         Bias                  = Log_Ratio - True_LogRatio)
 print(mean_falls_table)
 
 # nonparametric MCF with mets (as in 03): mean falls per arm and robust SE of the log ratio
@@ -187,10 +186,9 @@ print(mcf_q_sym)}
 #############################################################
 # ----- Section 6: Collect results -------------------------#
 #############################################################
-# effect estimates with the true value of each method (as in 03)
+# effect estimates, all models against the treatment-policy value True_Beta_GL (as in 03)
 comparison_table <- bind_rows(lapply(names(fits), function(m) {
-  true_beta <- if (startsWith(m, "LWYY")) truth$True_Beta_LWYY else truth$True_Beta_GL
-  extract_model_results(fits[[m]], m, true_beta)
+  extract_model_results(fits[[m]], m, truth$True_Beta_GL)
 })) %>%
   mutate(scenario_id = current_params$scenario_id[1],      # for the loop over all files
          sim_run     = current_params$sim_run[1],

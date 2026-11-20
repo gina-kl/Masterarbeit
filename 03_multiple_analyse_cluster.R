@@ -134,27 +134,26 @@ analyse_one_run <- function(file_path, sim_log, true_estimands) {
                   scenario_id = current_params$scenario_id[1], sim_run = current_params$sim_run[1]))
   }
 
-  # true value that belongs to each model
+  # true value of all models: limit of Ghosh-Lin on complete data = treatment-policy value (real world with death)
+  # LWYY treats death as censoring (rate among the living): with mortality its own limit True_Beta_LWYY differs,
+  # this difference shows in the bias of "LWYY 0: Full data". Without death both true values are the same.
   model_results <- bind_rows(lapply(names(fits), function(m) {
-    true_beta <- if (startsWith(m, "LWYY")) truth$True_Beta_LWYY else truth$True_Beta_GL
-    extract_model_results(fits[[m]], m, true_beta)
+    extract_model_results(fits[[m]], m, truth$True_Beta_GL)
   }))
 
   # -- Mean number of falls until week 52 (nonparametric and model estimate) --------------------------------
 
   # mean falls per arm (model-based = same model as the LWYY / GL row,
   # log(mu_1 / mu_0) is exactly the arm coefficient -> only the levels per arm are new)
-  # true values: LWYY -> limit of the LWYY fit on complete data (MCF_LWYY_*, as True_Beta_LWYY),
-  #              GL and nonparametric MCF -> real world with death (MCF_*)
+  # true values of all rows: real world with death (MCF_*); with mortality LWYY overestimates the levels
+  # (the dead have no more falls), its own limit on complete data is MCF_LWYY_* (00_true_estimands.csv)
   mcf_est <- mcf_estimate(Odat_all, Odat_w, fits, use_proxy)
 
-  mcf_results <- tibble(Model                = sub("^MCF-", "", names(mcf_est)),
-                        MCF_Control_hat      = sapply(mcf_est, `[`, 1),
-                        MCF_Intervention_hat = sapply(mcf_est, `[`, 2)) %>%
-    mutate(lwyy                  = startsWith(Model, "LWYY"),
-           true_mcf_control      = if_else(lwyy, truth$MCF_LWYY_Control,      truth$MCF_Control),
-           true_mcf_intervention = if_else(lwyy, truth$MCF_LWYY_Intervention, truth$MCF_Intervention)) %>%
-    dplyr::select(-lwyy)
+  mcf_results <- tibble(Model                 = sub("^MCF-", "", names(mcf_est)),
+                        MCF_Control_hat       = sapply(mcf_est, `[`, 1),
+                        MCF_Intervention_hat  = sapply(mcf_est, `[`, 2),
+                        true_mcf_control      = truth$MCF_Control,
+                        true_mcf_intervention = truth$MCF_Intervention)
 
   # nonparametric MCF: own rows, estimate = log ratio of mean falls (real world)
   # robust SE of the log ratio from mets (mcf_mets, functions.R) -> CI, test and coverage as for LWYY / GL

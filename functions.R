@@ -17,7 +17,7 @@
 # - deterministic, not related to the arm (golden ratio hash of ID)
 # - same offset for all falls of a person -> order within a person stays the same
 # - risk set is constant within a week (death/censoring only at t + 0.001) -> Breslow estimate unchanged
-tie_offset <- function(ID, eps = 0.01) eps * ((ID * 0.6180339887498949) %% 1)
+tie_offset <- function(ID, eps = 0.01){ eps * ((ID * 0.6180339887498949) %% 1)}
 
 
 # variables for the analysis, computed from the simulated data (same in 02, 03 and the bootstrap)
@@ -142,7 +142,7 @@ wald_results <- function(model_name, est, se, true_beta) {
 }
 
 # extract result out of cox model (LWYY) or recreg model (Ghosh-Lin)
-# true_beta: the true value that belongs to this method (True_Beta_LWYY or True_Beta_GL)
+# true_beta: true value of the comparison (03: True_Beta_GL = treatment-policy value, for LWYY and GL)
 extract_model_results <- function(model, model_name, true_beta) {
   warn <- attr(model, "warn")                    # warnings of the fit (safe_fit in fit_models)
   res <- if (is.logical(model)) {
@@ -422,9 +422,10 @@ weighted_mcf <- function(d, w = "w", falls = "n_falls", death = "death", breaks 
 # prediction for every person with arm set to 0 / 1, averaged over all persons
 # base_cov: one row per person with the covariates of the model (age, sex, log_base_falls)
 # Ghosh-Lin (recreg): mu_0(t) * exp(X beta)     -> real world with death (compare with MCF_*)
-# LWYY (coxph):       Lambda_0(t) * exp(X beta) -> compare with the limit of LWYY on complete data (MCF_LWYY_*,
-#                     true_block() in functions_dgp.R); equals the world without death (MCF_*_NoDeath) only if
-#                     death is independent of the falls given the covariates (here not: death depends on frailty)
+# LWYY (coxph):       Lambda_0(t) * exp(X beta) -> also compared with MCF_* (03); with death too high, because the
+#                     dead have no more falls. Its own limit on complete data is MCF_LWYY_* (true_block() in
+#                     functions_dgp.R); it equals the world without death (MCF_*_NoDeath) only if death is
+#                     independent of the falls given the covariates (here not: death depends on frailty)
 # log(MCF_1 / MCF_0) is exactly the coefficient of arm; new is only the level per arm
 # basehaz(centered = TRUE): Lambda_0 at the means of the covariates, centered = FALSE can over-/underflow
 model_mcf <- function(fit, base_cov, t.end = 52) {
@@ -581,8 +582,8 @@ save_rds_atomic <- function(object, file) {
 # populations, not repetitions.
 
 # ids: data streams 1 ... 1e5 - 1, true value streams from 1e5 on (limits checked in 01_generate)
-data_stream_id <- function(causal_id, sim_run) (causal_id - 1) * 1000 + sim_run       # sim_run <= 1000
-true_stream_id <- function(causal_id, block)   1e5 + (causal_id - 1) * 1000 + block   # block <= 1000
+data_stream_id <- function(causal_id, sim_run) (causal_id - 1) * 1000 + sim_run       # sim_run <= 1000, S20 run 7, causal id 3 -> seed 2007
+true_stream_id <- function(causal_id, block)   1e5 + (causal_id - 1) * 1000 + block   # block <= 1000 , + 100.000 -> not overlap with data
 
 # k-th substream of the stream with state s (k = 0: s itself)
 sub_stream <- function(s, k) {
